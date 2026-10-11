@@ -257,7 +257,11 @@ python3 tests/e2e.py --url http://127.0.0.1:8069 --db mydb   # real imports, che
 python3 tests/firefox.py --url http://127.0.0.1:8069 --db mydb   # the same essentials in Firefox
 python3 tools/make_fixtures.py  # regenerate tests/fixtures (needs openpyxl)
 python3 tools/make_icons.py     # regenerate src/icons (needs Pillow)
+python3 tools/make_store_images.py                          # store/ promo tiles
+python3 tools/make_screenshots.py --url http://127.0.0.1:8069 --db mydb   # store/screenshots/
 ```
+
+Store listing texts (Chrome Web Store and Firefox Add-ons) are in `store/LISTING.md`.
 
 The end-to-end test expects a database with demo data and the Sales and Contacts apps. It imports
 contacts and sale orders, checks them in the database and deletes them again.
