@@ -27,7 +27,7 @@
   ];
   const HISTORY_MAX = 30;
   const PREVIEW_ROWS = 200;
-  const K = { settings: "oi.settings", history: "oi.history", memory: (origin, db) => `oi.memory.${origin}|${db}`, versionOk: "oi.versionOk" };
+  const K = { settings: "oi.settings", history: "oi.history", memory: (origin, db) => `oi.memory.${origin}|${db}`, versionOk: "oi.versionOk", tried: "oi.triedSample" };
 
   // ---------------------------------------------------------------------------
   // storage helpers (never let a storage failure break the panel)
@@ -124,14 +124,16 @@
     h("button", { type: "button", role: "tab", "data-mode": "analyze", onclick: () => setMode("analyze") }, "Analyze"));
   const cancelBtn = h("button", { type: "button", class: "btn small", hidden: true, onclick: () => cancelTask() }, "Cancel");
   let discardArmed = null;
-  const discardBtn = h("button", { type: "button", class: "icon-btn", hidden: true, onclick: () => {
-    if (S.result || !S.job) return discard(); // nothing to lose: no confirmation
+  // "↺ Start over", bottom left, in every tab: throws the current work away and starts fresh.
+  const discardBtn = h("button", { type: "button", class: "btn small reset", hidden: true, onclick: () => {
+    // Only an import in progress has work worth a confirmation (mapping, decisions).
+    if (S.mode !== "import" || S.result || !S.job) return startOver();
     if (discardArmed) {
       clearTimeout(discardArmed);
       discardArmed = null;
-      return discard();
+      return startOver();
     }
-    discardBtn.textContent = "Discard everything? Click again";
+    discardBtn.textContent = "Discard the file, mapping and decisions? Click again";
     discardBtn.classList.add("armed");
     discardArmed = setTimeout(() => {
       discardArmed = null;
@@ -148,13 +150,12 @@
       modeSwitch,
       conn,
       h("span", { class: "spacer" }),
-      discardBtn,
       h("button", { type: "button", class: "icon-btn", title: "Past imports and undo", onclick: () => openHistory() }, "History"),
       h("button", { type: "button", class: "icon-btn big", title: "Close (Alt+Shift+I reopens it; your work is kept)", "aria-label": "Close", onclick: () => hide() }, "×"),
     ),
     stepNav,
     body,
-    h("footer", null, status, cancelBtn, h("span", { class: "spacer" }), backBtn, nextBtn),
+    h("footer", null, discardBtn, status, cancelBtn, h("span", { class: "spacer" }), backBtn, nextBtn),
     historySheet,
     toastEl,
   );
@@ -240,6 +241,30 @@
     render();
   }
 
+  // Start fresh in the current tab (the model stays).
+  function startOver() {
+    if (S.mode === "import") return discard();
+    if (S.op) {
+      if (S.op.kind === "import") return;
+      S.op.ctrl.abort();
+      endTask();
+      S.busy = "";
+    }
+    S.filters = [];
+    if (S.mode === "export") {
+      if (S.exp.done) URL.revokeObjectURL(S.exp.done.url);
+      Object.assign(S.exp, { purpose: null, columns: [], done: null, archived: false });
+      followPage("export");
+      prepareExport();
+    } else {
+      S.an.model = null; // prepareAnalyze starts again from the model's default grouping
+      prepareAnalyze();
+      followPage("analyze");
+    }
+    toast("Started over");
+    render();
+  }
+
   // Throw the current file, mapping and decisions away and start again (the model stays).
   function discard() {
     if (S.op && S.op.kind === "import") return;
@@ -248,7 +273,7 @@
       S.op.ctrl.abort();
       endTask();
     }
-    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map() });
+    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map(), sample: null });
     S.step = "source";
     toast(finished ? "Ready for a new import" : "Discarded");
     render();
@@ -482,9 +507,10 @@
     });
   }
 
-  async function openBook(book, sheet = 0, op = null) {
+  async function openBook(book, sheet = 0, op = null, { sample = null } = {}) {
     const rows = await book.sheets[sheet].load();
     if (op && !alive(op)) return;
+    S.sample = sample; // a file or paste of the user's own ends a sample run
     const header = OI.sheet.detectHeader(rows);
     S.book = { ...book, sheet, rows, header };
     S.job = null;
@@ -551,6 +577,7 @@
         } });
       wrap.append(paste);
       if (S.model && S.session) wrap.append(templateRow());
+      if (S.session) wrap.append(sampleCard());
       return wrap;
     }
 
@@ -571,6 +598,90 @@
       h("button", { type: "button", class: "btn small", onclick: () => { S.book = null; S.job = null; S.analysis = null; render(); } }, "Choose another file"));
     wrap.append(info, previewTable(table.headers, table.rows.slice(0, 8), table.lines));
     return wrap;
+  }
+
+  // ---------------------------------------------------------------------------
+  // try it: sample contacts built from this database, and a guide through the steps
+  let firstRun = false;
+  store.get(K.tried, false).then((tried) => {
+    firstRun = !tried;
+  });
+
+  // The sample is contacts: it only runs when the import is into Contact (res.partner).
+  function sampleCard() {
+    const ready = S.model === "res.partner";
+    return h("div", { class: `sample-card${firstRun && ready ? " highlight" : ""}${ready ? "" : " off"}` },
+      h("span", { class: "icon" }, "🧪"),
+      h("div", { class: "grow" },
+        h("b", null, "New here? Try it with sample contacts"),
+        h("div", { class: "muted small" }, ready
+          ? "8 contacts with a few typical mistakes (typos, a missing tag, an unknown country). The guide shows what happens at each step; nothing is saved unless you click Import, and one click removes them afterwards."
+          : "The sample is made of contacts: open the Contacts app in Odoo (or choose Contact in “Import into” above) to try it.")),
+      h("button", { type: "button", class: "btn primary", disabled: !ready, title: ready ? "" : "Only on Contact (res.partner)", onclick: () => startSample() }, "Try it"));
+  }
+
+  function startSample() {
+    if (S.model !== "res.partner") return toast("The sample is for Contacts: open the Contacts app first");
+    return task("sample", "Preparing sample contacts…", async (op) => {
+      const can = await OI.pipeline.creatable(op.deps, "res.partner");
+      if (!can.ok && can.noRights) throw new Error("Your Odoo user may not create contacts, so the sample can't be imported here. Try with a user who can.");
+      const sample = await OI.sample.build(op.client, S.deps.schemas, S.session);
+      if (!alive(op)) return;
+      await openBook({ name: "Sample contacts", ...OI.sheet.readPaste(sample.csv) }, 0, op, { sample: { ...sample, db: S.session.db } });
+      store.set(K.tried, true);
+      firstRun = false;
+      endTask();
+      setBusy("");
+      render(); // stays on the File step: the user goes on with "Match columns"
+    });
+  }
+
+  // The guide above each step of a sample run.
+  function sampleGuide() {
+    const smp = S.sample;
+    const a = S.analysis;
+    const lines = [];
+    const actions = [];
+    if (S.step === "source") lines.push(`${smp.rows} sample contacts are loaded below, with a few mistakes on purpose. Next: “Match columns” (bottom right).`);
+    else if (S.step === "map") lines.push("Every column was matched to a Contact field by itself (✓ auto). Next: Look up values.");
+    else if (S.step === "review") {
+      if (a && a.conflicts.length) {
+        lines.push(`The typos (${smp.typos.map((t) => `“${t}”`).join(", ")}) came back as close matches: accept them one by one or with “Accept all”.`);
+        lines.push(`“${smp.tag}” doesn't exist yet: Create it. “${smp.missing}” isn't a country: leave it empty or skip the row.`);
+        if (smp.state) lines.push(`“${smp.state.name}” exists in several countries: the Country column of its row settled it, nothing to do.`);
+      } else lines.push("All settled. Have a look at Preview data, then Continue.");
+    } else if (S.step === "import") {
+      const r = S.result;
+      if (!r) {
+        lines.push("“Check with Odoo” runs the whole import and saves nothing: try it first.");
+        lines.push(`“Import” then creates ${a ? a.stats.create : smp.rows} sample contacts in ${smp.db}. Stop here if you only wanted to see the check.`);
+      } else if (r.ok) {
+        const entry = S.history[0];
+        if (entry && entry.undone) lines.push("The sample records were removed. Try it again any time from the File step.");
+        else {
+          lines.push(`Done: ${r.created.length} sample contacts${r.deps && r.deps.length ? ` and the “${smp.tag}” tag` : ""} were created.`);
+          const remove = undoButton(entry, "Remove the sample records");
+          if (remove) actions.push(remove);
+        }
+        actions.push(
+          h("button", { type: "button", class: "btn small", onclick: () => openRecords("res.partner", r.created) }, "Open Contacts"),
+          h("button", { type: "button", class: "btn small", onclick: () => setMode("export") }, "Try Export"),
+          h("button", { type: "button", class: "btn small", onclick: () => trySampleAnalysis() }, "Try Analyze: contacts by country"));
+      }
+    }
+    return h("div", { class: "sample-guide", role: "note" },
+      h("span", { class: "tag-label" }, "🧪 Sample run"),
+      h("div", { class: "grow" }, lines.map((l) => h("div", null, l)), actions.length ? h("div", { class: "row", style: "margin-top:6px" }, actions) : null),
+      h("button", { type: "button", class: "icon-btn", "aria-label": "Hide the guide", title: "Hide the guide", onclick: () => { S.sample = null; render(); } }, "×"));
+  }
+
+  // Analyze, ready: contacts grouped by country.
+  async function trySampleAnalysis() {
+    const schema = await S.deps.schemas.load("res.partner");
+    const f = schema.fields.get("country_id");
+    Object.assign(S.an, { model: "res.partner", groupby: groupBy(["country_id"], f, [f.string]), split: null, measure: { agg: "count" }, chart: "auto", compare: "none", result: null });
+    S.filters = [];
+    setMode("analyze");
   }
 
   // "Not sure which columns?" -> a template for the model (and Odoo's own, when it ships one).
@@ -1399,7 +1510,7 @@
       h("div", { class: "stat good" }, h("b", null, a.stats.create), "to create"),
       h("div", { class: "stat good" }, h("b", null, a.stats.update), "to update"),
       a.stats.skip ? h("div", { class: "stat" }, h("b", null, a.stats.skip), "skipped") : null,
-      willCreate.length ? h("div", { class: "stat" }, h("b", null, willCreate.length), "linked records to create first") : null,
+      willCreate.length ? h("div", { class: "stat" }, h("b", null, willCreate.length), `linked record${willCreate.length === 1 ? "" : "s"} to create first`) : null,
       h("span", { class: "spacer" }),
       h("label", { class: "row small muted" }, "Rows per batch", h("input", { type: "number", min: "1", max: "5000", value: S.settings.batchSize, style: "width:80px",
         onchange: (e) => { S.settings.batchSize = Number(e.target.value) || 500; store.set(K.settings, S.settings); } }))));
@@ -1423,11 +1534,11 @@
       if (r.ok) {
         wrap.append(h("div", { class: "notice ok" }, h("span", { class: "big-ok" }, "✓"), h("div", { class: "grow" },
           h("b", null, `Imported: ${r.created.length} created, ${r.updated.length} updated.`),
-          r.deps && r.deps.length ? h("div", null, `Also created ${r.deps.reduce((s, d) => s + d.ids.length, 0)} linked records.`) : null,
+          r.deps && r.deps.length ? h("div", null, (() => { const n = r.deps.reduce((s2, d) => s2 + d.ids.length, 0); return `Also created ${n} linked record${n === 1 ? "" : "s"}.`; })()) : null,
           h("div", { class: "row", style: "margin-top:8px" },
             h("button", { type: "button", class: "btn small", onclick: () => openRecords(job.model, [...r.created, ...r.updated]) }, r.created.length + r.updated.length === 1 ? "Open the record" : "Open the list"),
             undoButton(S.history[0]),
-            h("button", { type: "button", class: "btn small", onclick: () => startOver() }, "Import another file")))));
+            h("button", { type: "button", class: "btn small", onclick: () => discard() }, "Import another file")))));
       } else {
         wrap.append(h("div", { class: "notice err" }, h("span", null, "✕"), h("div", { class: "grow" },
           h("b", null, r.cancelled ? "Stopped." : "The import stopped on an error."),
@@ -1467,11 +1578,6 @@
     return wrap;
   }
 
-  function startOver() {
-    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, reviewTab: "conflicts" });
-    go("source");
-  }
-
   // One record opens its form, several open the model's list (newest records first there).
   function openRecords(model, ids) {
     hide();
@@ -1502,7 +1608,7 @@
     await store.set(K.history, S.history);
   }
 
-  function undoButton(entry) {
+  function undoButton(entry, label = "Undo") {
     if (!entry || entry.undone || (!entry.created.length && !(entry.deps || []).length)) return null;
     const n = entry.created.length + (entry.deps || []).reduce((s, d) => s + d.ids.length, 0);
     let armed = false;
@@ -1511,7 +1617,7 @@
       if (!armed) {
         armed = true;
         btn.textContent = `Delete ${n} records? Click again`;
-        timer = setTimeout(() => { armed = false; btn.textContent = "Undo"; }, 4000);
+        timer = setTimeout(() => { armed = false; btn.textContent = label; }, 4000);
         return;
       }
       clearTimeout(timer);
@@ -1523,7 +1629,7 @@
       toast(errors.length ? `Undo failed: ${errors[0]}` : `${n} records deleted`);
       if (!historySheet.hidden) openHistory();
       render();
-    } }, "Undo");
+    } }, label);
     btn.title = entry.updated ? "Deletes the records this import created. Updated records keep their new values." : "Deletes the records this import created";
     return btn;
   }
@@ -1968,7 +2074,7 @@
     const a = S.an;
     if (!S.model || !S.session) return render();
     if (a.model !== S.model) {
-      Object.assign(a, { model: S.model, groupby: null, split: null, measure: { agg: "count" }, chart: "auto", compare: "none", result: null, count: null });
+      Object.assign(a, { model: S.model, groupby: null, split: null, measure: { agg: "count" }, top: 10, chart: "auto", compare: "none", archived: false, result: null, count: null });
       a.groupby = await defaultGroup(S.model).catch(() => null);
     }
     try {
@@ -2417,20 +2523,25 @@
       status.replaceChildren(`Odoo ${S.version.label}`);
       return;
     }
-    // Header: discard (not while records are being saved).
+    // Start over (not while records are being saved: "Stop after this batch" is for that).
     const importing = S.op && S.op.kind === "import";
-    discardBtn.hidden = !S.book || importing;
+    const work = S.mode === "import" ? !!(S.book || S.job)
+      : S.mode === "export" ? !!(S.exp.purpose || S.filters.length || S.exp.archived)
+        : !!(S.an.result || S.filters.length);
+    discardBtn.hidden = !work || importing;
     if (!discardArmed) {
       discardBtn.classList.remove("armed");
-      discardBtn.textContent = S.result ? "New import" : "Discard";
-      discardBtn.title = S.result ? "Start a new import" : "Throw this file, its mapping and your decisions away and start again";
+      const fresh = S.mode === "import" && S.result;
+      discardBtn.textContent = fresh ? "↺ New import" : "↺ Start over";
+      discardBtn.title = S.mode === "import"
+        ? fresh ? "Start a new import" : "Throw this file, its mapping and your decisions away and start again"
+        : S.mode === "export" ? "Back to “What is the file for?”, without filters" : "Back to the default chart, without filters or comparison";
     }
     cancelBtn.hidden = !S.op;
     cancelBtn.textContent = importing ? (S.op.ctrl.signal.aborted ? "Stopping after this batch…" : "Stop after this batch") : "Cancel";
     cancelBtn.disabled = importing && S.op.ctrl.signal.aborted;
     status.replaceChildren();
     if (S.mode === "analyze") {
-      discardBtn.hidden = true;
       backBtn.hidden = true;
       nextBtn.hidden = true;
       if (S.busy) status.append(h("span", { class: "spinner" }), " ", S.busy);
@@ -2439,7 +2550,6 @@
       return;
     }
     if (S.mode === "export") {
-      discardBtn.hidden = true;
       if (S.busy) status.append(h("span", { class: "spinner" }), " ", S.busy);
       else if (message) status.append(h("span", { style: isError ? "color: var(--danger)" : "" }, message));
       else status.append(S.exp.purpose ? "Add or remove columns, pick a format, export." : "Choose what the file is for.");
@@ -2491,6 +2601,8 @@
     } catch (e) {
       content = h("div", { class: "notice err" }, String(e && e.stack ? e.stack : e));
     }
+    if (S.mode === "import" && S.sample && !S.versionWarning) content = h("div", null, sampleGuide(), content);
+    if (S.mode === "import" && S.pageModel && S.pageModel.model !== S.model && !S.versionWarning) content = h("div", null, pageModelNotice(), content);
     if (S.versionWarning) content = versionBanner(); // the tools appear once the user chooses to try
     // A redraw (an analysis finishing, a count arriving) must not eat what the user is typing.
     const typing = shadow.activeElement;
@@ -2555,8 +2667,39 @@
     host.style.display = "";
     applyTheme();
     panel.focus();
-    // Reopened on another list or selection: Export/Analyze follow the page.
-    if (S.session && S.mode !== "import" && !S.op) followPage(S.mode);
+    if (S.session && !S.op) syncWithPage();
+  }
+
+  /* Reopened after moving around Odoo (it doesn't reload the page between apps): take the model
+   * the page shows now, unless an import of another model is in progress (then offer it), and let
+   * Export/Analyze follow the page's ticked records or search. */
+  async function syncWithPage() {
+    const model = await detectModel().catch(() => null);
+    S.pageModel = null;
+    if (model && model !== S.model) {
+      if (S.mode === "import" && (S.book || S.job)) {
+        const rows = await S.client.call("ir.model", "search_read", [[["model", "=", model]], ["name"]]).catch(() => []);
+        S.pageModel = { model, name: rows.length ? rows[0].name : model };
+        render();
+      } else {
+        await setModel(model);
+      }
+    }
+    if (S.mode !== "import" && !S.op) followPage(S.mode);
+  }
+
+  // "This page shows Contact; this import is into Lead. [Switch to Contact]"
+  function pageModelNotice() {
+    const p = S.pageModel;
+    if (!p || p.model === S.model) return null;
+    return h("div", { class: "notice info" }, h("span", null, "ℹ"),
+      h("div", { class: "grow" }, `This page shows ${p.name}; this import is into ${S.modelName}.`),
+      h("button", { type: "button", class: "btn small", title: "Discards the current file and its mapping", onclick: async () => {
+        discard();
+        await setModel(p.model);
+        S.pageModel = null;
+        render();
+      } }, `Switch to ${p.name}`));
   }
 
   function hide() {

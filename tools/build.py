@@ -41,6 +41,12 @@ def check_files(manifest, out):
     missing = [p for p in paths if p and not (out / p).is_file()]
     if missing:
         raise SystemExit(f"Missing files referenced by manifest: {missing}")
+    # Two top-level functions with the same name in one script: the later one silently wins.
+    for path in INJECTED:
+        names = re.findall(r"^  (?:async )?function (\w+)\(", (out / path).read_text(), re.M)
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            raise SystemExit(f"{path}: functions declared twice: {dups}")
     # Chrome refuses to inject a script that isn't clean UTF-8 ("It isn't UTF-8 encoded"):
     # control characters and Unicode non-characters must be written as escapes.
     for path in INJECTED + [manifest["background"].get("service_worker") or manifest["background"]["scripts"][0]]:

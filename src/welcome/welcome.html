@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to Odoo Import Export</title>
+<link rel="icon" href="../icons/icon-32.png">
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f6f5f8; --card: #ffffff; --fg: #1f1d24; --fg-2: #5d5a66; --border: #dcdae2;
+    --accent: #714b67; --accent-soft: #f3edf2; --teal: #017e84;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { color-scheme: dark; --bg: #16151a; --card: #1f1e25; --fg: #ebe9f0; --fg-2: #b4b1bd; --border: #34323c; --accent: #c79bbd; --accent-soft: #2e2533; --teal: #4fc3c8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 20px 64px; }
+  header { display: flex; gap: 18px; align-items: center; margin-bottom: 28px; }
+  header img { width: 72px; height: 72px; }
+  h1 { font-size: 26px; margin: 0; letter-spacing: -.01em; }
+  header p { margin: 4px 0 0; color: var(--fg-2); }
+  ol { list-style: none; counter-reset: step; padding: 0; margin: 0 0 28px; display: grid; gap: 12px; }
+  ol li { counter-increment: step; display: flex; gap: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  ol li::before { content: counter(step); flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 14px; }
+  ol li b { display: block; margin-bottom: 2px; }
+  ol li span { color: var(--fg-2); }
+  kbd { font: 12px ui-monospace, Menlo, Consolas, monospace; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; background: var(--card); }
+  .modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 28px; }
+  .modes div { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .modes b { color: var(--accent); }
+  .modes p { margin: 4px 0 0; color: var(--fg-2); font-size: 14px; }
+  .note { color: var(--fg-2); font-size: 14px; border-top: 1px solid var(--border); padding-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="../icons/icon-128.png" alt="">
+    <div>
+      <h1>Odoo Import Export is installed</h1>
+      <p>Import spreadsheets into any Odoo model, export to Excel or CSV, and chart your data, for Odoo 16 to 20.</p>
+    </div>
+  </header>
+
+  <ol>
+    <li><div><b>Open your Odoo and log in</b><span>Any page will do; the Contacts app is a good start.</span></div></li>
+    <li><div><b>Click the Odoo Import Export icon in the toolbar, or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></b>
+      <span>Don't see the icon? Click the puzzle piece next to the address bar and pin Odoo Import Export.</span></div></li>
+    <li><div><b>Click “Try it with sample contacts”</b>
+      <span>A guided run with 8 sample contacts and a few typical mistakes. Nothing is saved unless you click Import, and one click removes them afterwards.</span></div></li>
+  </ol>
+
+  <div class="modes">
+    <div><b>Import</b><p>Columns matched by themselves, links looked up before anything is written, a check with Odoo, undo.</p></div>
+    <div><b>Export</b><p>Data or files to edit and import back; the list's search or the ticked records; Excel or CSV.</p></div>
+    <div><b>Analyze</b><p>Group by any field, compare periods, save the chart as an image, Excel or PDF.</p></div>
+  </div>
+
+  <p class="note">Everything runs in your browser with your own Odoo login and access rights. Your data goes only to your Odoo server: no account, no tracking, no third-party service.</p>
+</main>
+</body>
+</html>

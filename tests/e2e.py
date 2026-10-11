@@ -307,7 +307,7 @@ def main():
         call = lambda model, method, *args, **kw: ev(f"E.call({json.dumps(model)}, {json.dumps(method)}, {json.dumps(list(args))}, {json.dumps(kw)})")  # noqa: E731
 
         # leftovers of an interrupted run
-        old = call("res.partner", "search", ["|", ["email", "=like", "%@oi.test"], ["email", "=like", "drop%@oi.test"]], context={"active_test": False})
+        old = call("res.partner", "search", ["|", "|", ["email", "=like", "%@oi.test"], ["email", "=like", "drop%@oi.test"], ["email", "=like", "sample+%@example.com"]], context={"active_test": False})
         if old:
             call("res.partner", "unlink", old)
         old = call("res.partner.category", "search", ["|", ["name", "=", "Prospectz"], ["name", "=like", "OI Bulk Tag %"]])
@@ -416,14 +416,14 @@ def main():
         def errors_explained():
             # Straight to Odoo's import (dry run), bypassing the panel's own matching: a country that
             # doesn't exist and a number that isn't one. Odoo's messages differ per version.
-            r = ev("""(async () => {
+            r = ev("""(async () => { for (let attempt = 0; ; attempt++) { try {
                 const f = await E.call('base_import.import', 'fields_get', [['file']], { attributes: ['help'] });
                 const csv = 'name,country_id,credit_limit\\nOI Err,Narnia,12x\\n';
                 const raw = /not base64/i.test(f.file.help || '');
                 const id = await E.call('base_import.import', 'create', [{ res_model: 'res.partner', file: raw ? csv : btoa(csv), file_name: 'e.csv', file_type: 'text/csv' }]);
                 const opts = { has_headers: true, quoting: '"', separator: ',', encoding: 'utf-8', date_format: '%Y-%m-%d', datetime_format: '%Y-%m-%d %H:%M:%S', float_decimal_separator: '.', float_thousand_separator: '' };
-                return E.call('base_import.import', 'execute_import', [[Array.isArray(id) ? id[0] : id], ['name', 'country_id', 'credit_limit'], ['name', 'country_id', 'credit_limit'], opts], { dryrun: true });
-            })()""")
+                return await E.call('base_import.import', 'execute_import', [[Array.isArray(id) ? id[0] : id], ['name', 'country_id', 'credit_limit'], ['name', 'country_id', 'credit_limit'], opts], { dryrun: true });
+            } catch (e) { if (attempt > 1 || !/fetch|Network/i.test(String(e))) throw e; } } })()""")
             msgs = [{"row": 0, "line": 2, "message": m["message"]} for m in r["messages"]]
             assert msgs, r
             groups = ev(f"OdooImport.errors.group({json.dumps(msgs)})")
@@ -568,9 +568,9 @@ def main():
         check("re-injecting toggles the same panel and keeps the work", ui_toggle)
 
         def ui_discard():
-            ev("U.q('header .icon-btn:not([hidden])').click(); true")  # first click arms it
-            assert "Click again" in ev("U.text('header')"), ev("U.text('header')")
-            ev("U.button('Discard everything').click(); true")
+            ev("U.q('footer .reset').click(); true")  # first click arms it
+            assert "Click again" in ev("U.text('footer .reset')"), ev("U.text('footer')")
+            ev("U.q('footer .reset').click(); true")
             wait("!!U.q('.drop') && U.q('nav.steps button.active').textContent.includes('File')")
             assert ev("U.q('nav.steps button:nth-child(2)').disabled"), "Columns step must be unreachable"
         check("discard throws the work away and goes back to the file", ui_discard)
@@ -613,7 +613,7 @@ def main():
         check("stop during the import: finished batches are kept and can be undone", ui_stop_import)
 
         def ui_fast_mode():
-            ev("U.q('header .icon-btn:not([hidden])').click(); true")  # "New import": no confirmation after a result
+            ev("U.q('footer .reset').click(); true")  # "New import": no confirmation after a result
             wait("!!U.q('.drop')")
             ev("U.paste('Name,Email\\nOI Fast,fast@oi.test'); true")
             wait("U.text('.file-info').includes('1 rows')")
@@ -635,7 +635,7 @@ def main():
         check("fast mode imports without chatter messages", ui_fast_mode)
 
         def ui_bulk_missing():
-            ev("U.q('header .icon-btn:not([hidden])').click(); true")  # New import
+            ev("U.q('footer .reset').click(); true")  # "New import": no confirmation after a result
             wait("!!U.q('.drop')")
             rows = ["Name\tEmail\tCountry\tTags"] + [f"OI Bulk {i}\tbulk{i}@oi.test\tNowhereland {i}\tOI Bulk Tag {i}" for i in range(40)]
             ev(f"U.paste({json.dumps(chr(10).join(rows))}); true")
@@ -974,10 +974,16 @@ def main():
             wait("U.text('.export .count').startsWith('2 records')", timeout=30)
             # Untick, search "Azure" in Odoo: the export follows the list's search.
             chrome.evaluate("""(() => { document.querySelectorAll('.o_data_row .o_list_record_selector input:checked').forEach((b) => b.click()); })()""")
-            chrome.evaluate("""(() => { const i = document.querySelector('.o_searchview_input'); i.focus(); i.value = 'Azure'; i.dispatchEvent(new Event('input', {bubbles: true})); })()""")
-            chrome.wait("!!document.querySelector('.o_searchview_autocomplete li, .o_searchview_autocomplete .o-dropdown-item, .o_searchview_autocomplete a')", timeout=15)
-            chrome.evaluate("""document.querySelector('.o_searchview_input').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}))""")
-            chrome.wait("document.querySelector('.o_facet_values, .o_searchview_facet') !== null", timeout=15)
+            for attempt in range(3):  # Odoo's search bar: type, wait for its suggestions, Enter
+                chrome.evaluate("""(() => { const i = document.querySelector('.o_searchview_input'); i.focus(); i.value = 'Azure'; i.dispatchEvent(new Event('input', {bubbles: true})); })()""")
+                try:
+                    chrome.wait("!!document.querySelector('.o_searchview_autocomplete li, .o_searchview_autocomplete .o-dropdown-item, .o_searchview_autocomplete a')", timeout=15)
+                    chrome.evaluate("""document.querySelector('.o_searchview_input').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}))""")
+                    chrome.wait("document.querySelector('.o_facet_values, .o_searchview_facet') !== null", timeout=15)
+                    break
+                except TimeoutError:
+                    if attempt == 2:
+                        raise
             azure = call("res.partner", "search_count", ["|", ["display_name", "ilike", "Azure"], ["email", "ilike", "Azure"]])
             ev("__odooImport.hide(); true")
             ev("__odooImport.show(); true")
@@ -1010,6 +1016,8 @@ def main():
             chart_ready()
             pick_field("groupby", "Customer", "partner_id")
             chart_ready()
+            ev("""(() => { const s = U.qa('.ctl select').find((x) => x.getAttribute('aria-label') === 'Measure'); if (s.value !== 'count') { s.value = 'count'; s.dispatchEvent(new Event('change')); } })(); true""")
+            chart_ready()
             ev("""(() => { const s = U.qa('.ctl select').find((x) => x.getAttribute('aria-label') === 'Compare with'); s.value = 'previous'; s.dispatchEvent(new Event('change')); })(); true""")
             chart_ready()
             wait("U.qa('.analyze table.grid thead th').length === 5")
@@ -1036,6 +1044,124 @@ def main():
             chart_ready()
             ev("U.q('.modes [data-mode=import]').click(); true")
         check("compare: this month vs the previous one, totals match Odoo; Excel has both periods", analyze_compare)
+
+
+        def start_over_tabs():
+            # Export: purpose + filter, then Start over -> the purpose question, no filter
+            ev("U.q('.modes [data-mode=export]').click(); true")
+            wait("!!U.q('.choice') || !!U.q('ol.columns')", timeout=30)
+            if ev("!!U.q('.choice')"):
+                ev("U.qa('.choice')[0].click(); true")
+                wait("U.qa('ol.columns li').length >= 1", timeout=90)
+            wait("!!U.q('.export .count') && !__odooImport.state.op", timeout=30)  # the count redraws the tab
+            time.sleep(0.5)
+            pick_field("filter-add", "Name", "name")
+            wait("U.qa('.filter-row').length >= 1")
+            state = ev("({hidden: U.q('footer .reset').hidden, text: U.text('footer .reset'), mode: __odooImport.state.mode, filters: __odooImport.state.filters.length, purpose: __odooImport.state.exp.purpose, op: __odooImport.state.op && __odooImport.state.op.kind})")
+            assert not state["hidden"] and state["text"] == "↺ Start over", state
+            shot("16-export-start-over")
+            ev("U.q('footer .reset').click(); true")
+            wait("!!U.q('.choice') && U.qa('.filter-row').length === 0", timeout=30)
+            # Analyze: change the grouping, then Start over -> the default grouping again
+            ev("U.q('.modes [data-mode=analyze]').click(); true")
+            chart_ready()
+            default = ev("U.q('.ctl .chip') && U.q('.ctl .chip').textContent")
+            pick_field("groupby", "create_date", "create_date")  # labelled "Created on" or "Creation Date" depending on the model
+            wait(f"U.q('.ctl .chip') && U.q('.ctl .chip').textContent !== {json.dumps(default)}")
+            chart_ready()
+            ev("U.q('footer .reset').click(); true")
+            wait(f"U.q('.ctl .chip') && U.q('.ctl .chip').textContent === {json.dumps(default)}", timeout=30)
+            chart_ready()
+            ev("U.q('.modes [data-mode=import]').click(); true")
+        check("start over in Export and Analyze", start_over_tabs)
+
+
+        def sample_run():
+            ev("U.q('.modes [data-mode=import]').click(); true")
+            for _ in range(2):  # Start over (a second click confirms when an import is in progress)
+                if ev("!!U.q('footer .reset') && !U.q('footer .reset').hidden"):
+                    ev("U.q('footer .reset').click(); true")
+            wait("!!U.q('.sample-card')", timeout=30)
+            # Only on Contact: elsewhere the button is disabled with a hint.
+            ev("U.type('.model-picker input', 'sale.order'); true")
+            wait("U.qa('.model-picker li').some((li) => li.querySelector('.tech').textContent === 'sale.order')")
+            ev("U.qa('.model-picker li').find((li) => li.querySelector('.tech').textContent === 'sale.order').dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); true")
+            wait("U.q('.sample-card.off') && U.button('Try it').disabled && U.text('.sample-card').includes('open the Contacts app')", timeout=30)
+            ev("U.type('.model-picker input', 'res.partner'); true")
+            wait("U.qa('.model-picker li').some((li) => li.querySelector('.tech').textContent === 'res.partner')")
+            ev("U.qa('.model-picker li').find((li) => li.querySelector('.tech').textContent === 'res.partner').dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); true")
+            wait("!U.button('Try it').disabled", timeout=30)
+            ev("U.button('Try it').click(); true")
+            # Stays on the File step: the sample is loaded, the user goes on.
+            wait("!!U.q('.sample-guide') && !!U.q('.file-info')", timeout=60)
+            assert ev("U.q('nav.steps button.active').textContent.includes('File')")
+            assert "8 rows" in ev("U.text('.file-info')") and "Match columns" in ev("U.text('.sample-guide')"), ev("U.text('.sample-guide')")
+            ev("U.next(); true")
+            wait("U.q('nav.steps button.active').textContent.includes('Columns')", timeout=60)
+            assert "matched" in ev("U.text('.sample-guide')"), ev("U.text('.sample-guide')")
+            assert ev("U.q('.model-picker input') === null || true")
+            mapping = ev("U.qa('.map-table tbody tr').map((tr) => [tr.querySelector('.colname').firstChild.textContent, tr.querySelector('.chip').textContent])")
+            assert all(c in ("✓ auto", "✓ remembered") for _, c in mapping), mapping
+            ev("U.next(); true")
+            wait("U.q('nav.steps button.active').textContent.includes('Review')", timeout=60)
+            guide = ev("U.text('.sample-guide')")
+            assert "close matches" in guide and "Sample tag" in guide and "Atlantis" in guide, guide
+            shot("17-sample-review")
+            if ev("!!U.button('Accept all')"):
+                ev("U.button('Accept all').click(); true")
+            wait("!U.qa('.card, .group').some((c) => c.textContent.includes('close match'))", timeout=15)
+            ev("U.qa('.card').find((c) => c.textContent.includes('Sample tag')).querySelector('button.btn.small:not(.danger)').textContent")
+            ev("[...U.qa('.card').find((c) => c.textContent.includes('Sample tag')).querySelectorAll('button')].find((b) => b.textContent.startsWith('Create')).click(); true")
+            ev("[...U.qa('.card').find((c) => c.textContent.includes('Atlantis')).querySelectorAll('button')].find((b) => b.textContent === 'Leave empty').click(); true")
+            wait("!!U.q('.notice.ok')", timeout=15)
+            ev("U.next(); true")
+            wait("U.q('nav.steps button.active').textContent.includes('Import')")
+            assert "saves nothing" in ev("U.text('.sample-guide')")
+            ev("U.button('Check with Odoo').click(); true")
+            wait("!!U.q('.notice.ok') && U.text('.notice.ok').includes('accepts every row')", timeout=60)
+            ev("U.next(); true")
+            wait("U.text('.sample-guide').includes('Done:')", timeout=60)
+            n = call("res.partner", "search_count", [["email", "=like", "sample+%@example.com"]])
+            assert n == 8, n
+            tag = ev("__odooImport.state.sample.tag")
+            assert call("res.partner.category", "search_count", [["name", "=", tag]]) == 1
+            shot("18-sample-done")
+            ev("U.button('Remove the sample records').click(); true")
+            ev("U.button('records? Click again').click(); true")
+            wait("U.text('.sample-guide').includes('were removed')", timeout=60)
+            assert call("res.partner", "search_count", [["email", "=like", "sample+%@example.com"]], context={"active_test": False}) == 0
+            assert call("res.partner.category", "search_count", [["name", "=", tag]]) == 0
+            ev("U.button('Try Analyze').click(); true")
+            wait("U.q('nav.steps').hidden && !!U.q('.ctl .chip') && U.q('.ctl .chip').textContent === 'Country'", timeout=30)
+            wait("!!U.q('.chart-box svg') && !__odooImport.state.op", timeout=60)
+            ev("U.q('.modes [data-mode=import]').click(); true")
+        check("try it: sample contacts, guided review, check, import, remove, then Analyze", sample_run)
+
+
+        def follows_the_page():
+            # Odoo moves between apps without reloading: reopening the panel follows the page.
+            ev("U.q('.modes [data-mode=import]').click(); true")
+            for _ in range(2):
+                if ev("!!U.q('footer .reset') && !U.q('footer .reset').hidden"):
+                    ev("U.q('footer .reset').click(); true")
+            ev("__odooImport.hide(); true")
+            go = lambda action: chrome.evaluate(f"odoo.__WOWL_DEBUG__.root.env.services.action.doAction({json.dumps(action)}).then(() => true)")
+            go("sale.action_orders")  # present in every test database (CRM isn't)
+            time.sleep(1.5)
+            ev("__odooImport.show(); true")
+            wait("U.q('.model-picker input').value.includes('sale.order')", timeout=30)
+            # A file in progress for Sales Orders, then Contacts: the import isn't thrown away silently.
+            ev("U.paste('Customer\\nAzure Interior'); true")
+            wait("U.text('.file-info').includes('1 rows')")
+            ev("__odooImport.hide(); true")
+            go("contacts.action_contacts")
+            time.sleep(1.5)
+            ev("__odooImport.show(); true")
+            wait("U.text('main.body').includes('This page shows') && !!U.button('Switch to')", timeout=30)
+            assert ev("U.q('.model-picker input').value.includes('sale.order')"), "the import in progress keeps its model"
+            ev("U.button('Switch to').click(); true")
+            wait("U.q('.model-picker input').value.includes('res.partner') && !U.q('.file-info')", timeout=30)
+        check("reopening follows the Odoo page's model (and asks when an import is in progress)", follows_the_page)
 
         # ------------------------------------------------------------------
         # unsupported versions: the server is made to report 15.0, then 21.0

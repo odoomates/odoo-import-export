@@ -72,9 +72,16 @@
       };
       if (await baseImportAvailable()) {
         const csv = NS.csv.serialize([matrix.fields, ...rows]);
-        const res = await client.call("base_import.import", "create", [{
-          res_model: model, file: rawFile ? csv : base64(csv), file_name: "odoo-import.csv", file_type: "text/csv",
-        }]);
+        // The import wizard is a temporary record: creating it again after a dropped connection is harmless.
+        const wizardValues = [{ res_model: model, file: rawFile ? csv : base64(csv), file_name: "odoo-import.csv", file_type: "text/csv" }];
+        let res;
+        try {
+          res = await client.call("base_import.import", "create", wizardValues);
+        } catch (e) {
+          if (e.title !== "Network error") throw e;
+          await new Promise((r) => setTimeout(r, 800));
+          res = await client.call("base_import.import", "create", wizardValues);
+        }
         const wizard = Array.isArray(res) ? res[0] : res;
         const execute = () => client.call("base_import.import", "execute_import", [[wizard], matrix.fields, matrix.columns, options], { dryrun }, context);
         try {

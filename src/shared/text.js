@@ -52,16 +52,21 @@
     return total ? (2 * inter) / total : 0;
   }
 
+  // Edit distance where swapping two neighbouring letters counts as one edit ("Frnace",
+  // "Spian"): optimal string alignment.
   function levenshtein(a, b) {
     if (a === b) return 0;
     if (!a.length) return b.length;
     if (!b.length) return a.length;
+    let prev2 = null;
     let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
     for (let i = 1; i <= a.length; i++) {
       const cur = [i];
       for (let j = 1; j <= b.length; j++) {
         cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        if (prev2 && i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) cur[j] = Math.min(cur[j], prev2[j - 2] + 1);
       }
+      prev2 = prev;
       prev = cur;
     }
     return prev[b.length];
@@ -98,9 +103,10 @@
     return Math.max(tokenSetSim(na, nb), trigramSim(na, nb) * 0.95);
   }
 
-  // Rank many choices against one string: a cheap trigram pass keeps the best `pool`, then
-  // the full similarity orders them. choices: [{label, ...}] (trigrams cached on the objects).
-  function rank(query, choices, { limit = 8, pool = 25 } = {}) {
+  // Rank many choices against one string: a cheap trigram pass keeps the best `pool` (all of a
+  // small list such as countries: a swapped-letter typo shares few trigrams), then the full
+  // similarity orders them. choices: [{label, ...}] (trigrams cached on the objects).
+  function rank(query, choices, { limit = 8, pool = 400 } = {}) {
     const q = trigrams(query);
     const dice = (g) => {
       let inter = 0;

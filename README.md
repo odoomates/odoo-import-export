@@ -11,6 +11,17 @@ File  →  Columns  →  Review  →  Import
          (auto)      (conflicts)  (check with Odoo, import, undo)
 ```
 
+## Try it in a minute
+
+After installing, a short welcome page explains how to start. Open your Odoo, click the toolbar icon
+(or **Alt+Shift+I**) and choose **Try it with sample contacts** on the Import tab: 8 contacts built
+from your own database (its countries, states, tags and your user name) with typical mistakes: typos
+(*Frnace*, *Spian*, *Untied States*), a tag that doesn't exist yet, a country that doesn't exist, a
+state name shared by two countries. A guide above each step says what to look at. *Check with Odoo*
+saves nothing; nothing is imported unless you click **Import**, and **Remove the sample records**
+deletes them (and the tag) afterwards. The guide then offers **Try Export** and **Try Analyze**
+(contacts by country). The rows are clearly marked (*Sample – …*, `sample+…@example.com`).
+
 ## What it does
 
 **File**: drop a CSV/TSV, XLSX or ODS file, or copy cells in Excel / Google Sheets and press Ctrl+V.
@@ -206,7 +217,7 @@ apply. Odoo Import Export never sees your password.
 
 | Odoo | Status |
 |---|---|
-| 19.x, 19.5+ (master) | Tested: full end-to-end suite (36 checks) |
+| 19.x, 19.5+ (master) | Tested: full end-to-end suite (38 checks) |
 | 18.0 | Tested: full end-to-end suite |
 | 17.0 | Tested: full end-to-end suite |
 | 16.0 | Tested: full end-to-end suite |

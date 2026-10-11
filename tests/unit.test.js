@@ -20,6 +20,11 @@ test("similarity ranks close strings higher", () => {
     ok(text.similarity("Desc", "Description") >= 0.6, "prefix abbreviation");
     ok(text.similarity("Adress", "Address") >= 0.7, "typo");
     ok(text.similarity("Phone", "Zip") < 0.3, "unrelated");
+    eq(text.levenshtein("frnace", "france"), 1, "a swap is one edit");
+    ok(text.similarity("Frnace", "France") >= 0.85 && text.similarity("Spian", "Spain") >= 0.85, "swapped letters");
+    ok(text.similarity("Untied States", "United States") >= 0.85, "swap in one word of two");
+    const countries = ["Spain", "Sweden", "Switzerland", "Swaziland", "Saint Lucia", "Slovenia"].map((label, id) => ({ id, label }));
+    eq(text.rank("Spian", countries)[0].label, "Spain");
 });
 
 // ---------------------------------------------------------------------------
@@ -567,4 +572,11 @@ test("comparisons: periods, labels, aligned values", () => {
     eq([...svg.querySelectorAll(".mark")][1].getAttribute("fill"), chart.THEMES.light.others, "the other period is gray");
 });
 
+test("sample data: typos made from real names", () => {
+    const t = globalThis.OdooImport.sample.typo;
+    eq(t("France"), "Frnace");
+    eq(t("United States"), "Untied States");
+    eq(t("Mitchell Admin"), "Micthell Admin");
+    ok(t("Spain", new Set(["sapin"])) !== "Spain", "never the name itself");
+});
 finish();

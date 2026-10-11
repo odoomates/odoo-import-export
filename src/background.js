@@ -29,6 +29,7 @@ const FILES = [
   "src/shared/chart.js",
   "src/shared/export.js",
   "src/shared/template.js",
+  "src/shared/sample.js",
   "src/shared/pipeline.js",
   "src/content/panel-css.js",
   "src/content/odoo-import.js",
@@ -53,3 +54,8 @@ async function toggle(tab) {
 }
 
 api.action.onClicked.addListener(toggle);
+
+// First install: a short page on how to start (not on updates).
+api.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "install") api.tabs.create({ url: api.runtime.getURL("src/welcome/welcome.html") });
+});
