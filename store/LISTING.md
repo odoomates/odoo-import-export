@@ -107,7 +107,7 @@ Source: https://github.com/odoomates/odoo-import-export
 
 **Submit a New Add-on → On this site** (listed) → upload `dist/odoo-import-export-<version>-firefox.zip`.
 
-- Compatibility: Firefox (desktop), minimum 128 (from the manifest)
+- Compatibility: Firefox (desktop), minimum 140 (from the manifest)
 - Source code: **not needed**. Nothing is minified, transpiled or bundled; the package is the source.
 - Summary / description / homepage / support / license (MIT) / privacy policy: as above
 - Categories: *Productivity*, *Other*

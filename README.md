@@ -242,7 +242,7 @@ Differences handled per version:
 - **Rules**: whether a country can be created from a name depends on the version (the code is
   required from 17 on); the panel reads the rules from Odoo rather than assuming them.
 
-Browsers: Chrome/Edge 103+ (tested in Chrome and Chromium), Firefox 128+ (tested in Firefox 155:
+Browsers: Chrome/Edge 103+ (tested in Chrome and Chromium), Firefox 140+ (tested in Firefox 155:
 unit tests, the packaged add-on, and an import, an export and a chart on a real Odoo).
 
 
