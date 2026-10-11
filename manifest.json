@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Odoo Import Export",
+  "short_name": "Import Export",
+  "version": "0.1.0",
+  "description": "Import spreadsheets into any Odoo model with automatic matching and undo; export to Excel or CSV; chart any model.",
+  "icons": {
+    "16": "src/icons/icon-16.png",
+    "32": "src/icons/icon-32.png",
+    "48": "src/icons/icon-48.png",
+    "128": "src/icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Odoo Import Export: open the import panel (Alt+Shift+I)",
+    "default_icon": {
+      "16": "src/icons/icon-16.png",
+      "32": "src/icons/icon-32.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "scripts": [
+      "src/background.js"
+    ]
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+I"
+      },
+      "description": "Toggle the Odoo Import Export panel"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "odooimportexport@odooimportexport.app",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  }
+}
