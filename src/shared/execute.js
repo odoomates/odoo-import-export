@@ -8,6 +8,11 @@
  *
  * Records the user chose to create (missing many2one values) are created first with
  * name_create; during a dry run an existing record stands in for them.
+ *
+ * Records linking to other new records of the same file (a contact and its parent company)
+ * are imported after the records they link to, the links sent as external ids: Odoo resolves
+ * them as it imports, in the same batch or an earlier one. When a link column also names
+ * existing records, they are imported in rounds instead, each round with the ids of the last.
  */
 (() => {
   "use strict";
@@ -173,13 +178,38 @@
       }
 
       // Updates and creations go in separate passes when rows are matched by a key, so the
-      // ".id" column is only sent where every row has one.
+      // ".id" column is only sent where every row has one. Records linking to new records of the
+      // file go last (a dry run leaves these links empty: every batch is rolled back).
       const passes = NS.plan.needsDbId(job) ? ["update", "create"] : [null];
-      const matrices = passes.map((part) => NS.plan.build(job, analysis, { created, placeholder, part })).filter((m) => m.rows.length);
-      const total = matrices.reduce((n, m) => n + m.rows.length, 0);
+      let steps = passes.map((part) => ({ part }));
+      let first = null;
+      if (!dryrun && analysis.inFile && analysis.inFile.size) {
+        const xmlids = NS.plan.xmlids(job, analysis, Date.now().toString(36));
+        // The linked updates after the linked creations: nothing links to a record being updated.
+        steps = [...passes.map((part) => ({ part, linked: false })), ...passes.slice().reverse().map((part) => ({ part, linked: true }))].map((step) => ({ ...step, xmlids }));
+        first = steps.map((step) => NS.plan.build(job, analysis, { created, placeholder, ...step }));
+        if (first.some((m) => m.mixed)) {
+          // Rounds: a record linking to a new record of the file is built once its id is known.
+          const levels = [...new Set([0, ...analysis.levels.values()])].sort((a, b) => a - b);
+          steps = levels.flatMap((level) => passes.map((part) => ({ level, part })));
+          first = null;
+        }
+      }
+      first = first || steps.map((step) => NS.plan.build(job, analysis, { created, placeholder, ...step }));
+      const ids = new Map(); // source row -> id of its record (rounds)
+      const total = first.reduce((n, m) => n + m.rows.length, 0);
       let done = 0;
       let stop = false;
-      for (const matrix of matrices) {
+      for (const [n, step] of steps.entries()) {
+        if (!first[n].rows.length) continue;
+        const matrix = step.level ? NS.plan.build(job, analysis, { created, placeholder, ...step, rowIds: ids }) : first[n];
+        if (step.level && !dryrun) {
+          const lost = [...analysis.inFile].filter(([at, t]) => !ids.has(t) && analysis.levels.get(Number(at.split(":")[1])) === step.level);
+          if (lost.length) {
+            const rows = [...new Set(lost.map(([at]) => Number(at.split(":")[1])))];
+            result.warnings.push({ row: rows[0], line: job.table.lines[rows[0]], message: `${lost.length} link${lost.length > 1 ? "s" : ""} to records of this file couldn't be set (the connection dropped while they were imported); rows ${rows.slice(0, 5).map((r) => job.table.lines[r]).join(", ")}${rows.length > 5 ? "…" : ""}.` });
+          }
+        }
         for (const part of batches(matrix.groups, batchSize)) {
           if (signal && signal.aborted) {
             result.ok = false;
@@ -224,10 +254,13 @@
             }
           } else if (!dryrun && res.recovered) {
             result.created.push(...res.ids); // found after a dropped connection: new records of this batch
+            // Odoo numbers new records in order: a batch of new records only maps back to its rows.
+            if (res.ids.length === part.length && part.every((g) => !NS.plan.existingTarget(job, g.src[0]))) part.forEach((g, k) => ids.set(g.src[0], res.ids[k]));
           } else if (!dryrun) {
             part.forEach((g, k) => {
               const id = res.ids[k];
               if (!id) return;
+              ids.set(g.src[0], id);
               const target = NS.plan.existingTarget(job, g.src[0]);
               (target ? result.updated : result.created).push(id);
             });
@@ -256,7 +289,9 @@
     }
 
     // Undo: delete what an import created (records, then the many2one records it created).
+    // A stock count is undone by restoring the counts (see inventory.undo).
     async function undo(entry) {
+      if (entry.count) return NS.inventory.undo(client, entry);
       const errors = [];
       if (entry.created.length) {
         try {
@@ -275,7 +310,7 @@
       return errors;
     }
 
-    return { run, undo, baseImportAvailable };
+    return { run, undo, baseImportAvailable, batch: runBatch };
   }
 
   NS.execute = { createExecutor, batches, base64 };

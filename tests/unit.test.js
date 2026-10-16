@@ -338,6 +338,255 @@ test("one2many lines: continuation rows stay with their record", () => {
     eq(execute.batches(m.groups, 2).map((b) => b.length), [1, 1]);
 });
 
+// A contact's parent company that is a row of the same file.
+function selfJob(rows, resolutions, extra = []) {
+    const j = job(["Name", "Company", "Email", ...extra.map((e) => e[0])], rows, [["name"], ["parent_id"], ["email"], ...extra.map((e) => e[1])], { 1: resolutions });
+    j.inFile = plan.fileIndex(j, ["name", "email"]);
+    return j;
+}
+
+test("in-file links: values naming a row of the file link to its record, imported first", () => {
+    const j = selfJob([
+        ["Acme", "", "info@acme.test"],
+        ["John", "Acme", "john@acme.test"],
+        ["Beta Corp", "", ""],
+        ["Jane", "beta corp", ""],
+        ["Zed", "Gamma", ""],
+        ["Ann", "Delta", ""],
+        ["Bob", "INFO@acme.test", ""],
+    ], {
+        Acme: { status: "missing", candidates: [] },
+        "beta corp": { status: "probable", id: 9, candidates: [C(9, "Beta Ltd")] },
+        Gamma: { status: "missing", candidates: [] },
+        Delta: { status: "ok", id: 50, candidates: [C(50, "Delta")] },
+        "INFO@acme.test": { status: "missing", candidates: [] },
+    });
+    const a = plan.analyze(j);
+    eq(a.conflicts.map((c) => c.key), ["m2o:1:gamma"], "only the value that is neither in the file nor in Odoo");
+    eq([...a.inFile], [["1:1:acme", 0], ["1:3:beta corp", 2], ["1:6:info@acme.test", 0]]);
+    eq([...a.levels], [[1, 1], [3, 1], [6, 1]]);
+    eq(a.stats.inFile, 3);
+    j.decisions.set("m2o:1:gamma", { action: "empty" });
+    const b = plan.analyze(j);
+    eq(plan.build(j, b, { level: 0 }).rows.map((r) => r[0]), ["Acme", "Beta Corp", "Zed", "Ann"]);
+    eq(plan.build(j, b, { level: 0 }).rows[3][1], "50");
+    const second = plan.build(j, b, { level: 1, rowIds: new Map([[0, 100], [2, 200]]) });
+    eq(second.rows.map((r) => [r[0], r[1]]), [["John", "100"], ["Jane", "200"], ["Bob", "100"]]);
+    eq(second.groups.map((g) => g.src), [[1], [3], [6]]);
+    // a dry run doesn't know the ids: the link stays empty, never an existing record
+    eq(plan.build(j, b, { level: 1 }).rows.map((r) => r[1]), ["", "", ""]);
+});
+
+test("in-file links: existing records, skipped rows, several rows, circles", () => {
+    // the parent row updates an existing record: its id, no second round
+    let j = selfJob([["Acme", "", "info@acme.test"], ["John", "Acme", "john@acme.test"]], { Acme: { status: "ok", id: 7, candidates: [C(7, "Acme")] } });
+    j.key = { col: 2, field: "email", mode: "skip" };
+    j.existing = new Map([["info@acme.test", [{ id: 7, label: "Acme" }]]]);
+    let a = plan.analyze(j);
+    eq([a.inFile.size, a.levels.size, a.rowId.get("1:1:acme")], [0, 0, 7]);
+    eq(plan.build(j, a).rows, [["John", "7", "john@acme.test"]]);
+
+    // the parent row is skipped: the value is looked up in Odoo as usual
+    j = selfJob([["Acme", "", "", "Narnia"], ["John", "Acme", "", "Belgium"]], { Acme: { status: "missing", candidates: [] } }, [["Country", ["country_id"]]]);
+    j.resolutions.set(3, new Map([["Narnia", { status: "missing", candidates: [] }], ["Belgium", { status: "ok", id: 21, candidates: [] }]]));
+    j.rel.set(3, { field: PARTNER.find((f) => f.name === "country_id"), mode: "name", sep: "," });
+    j.decisions.set("m2o:3:narnia", { action: "skip", rows: [0] });
+    a = plan.analyze(j);
+    eq(a.conflicts.map((c) => c.key), ["m2o:1:acme"]);
+
+    // a name shared by two rows: the first one, with a warning; an existing namesake: warned
+    j = selfJob([["Acme", "", ""], ["Acme", "", ""], ["John", "Acme", ""]], { Acme: { status: "ok", id: 7, candidates: [C(7, "Acme")] } });
+    a = plan.analyze(j);
+    eq(a.inFile.get("1:2:acme"), 0);
+    eq(a.warnings.map((w) => [w.kind, w.title]), [["infile", "“Acme” is the name of 2 rows of this file"]]);
+    j = selfJob([["Acme", "", ""], ["John", "Acme", ""]], { Acme: { status: "ok", id: 7, candidates: [C(7, "Acme")] } });
+    eq(plan.analyze(j).warnings.map((w) => w.title), ["“Acme” is also an existing Related Company"]);
+
+    // a row naming itself isn't a link to the file
+    j = selfJob([["Acme", "Acme", ""]], { Acme: { status: "missing", candidates: [] } });
+    eq(plan.analyze(j).conflicts.map((c) => c.key), ["m2o:1:acme"]);
+
+    // A -> B -> A: the link closing the circle is a conflict of its row
+    j = selfJob([["A", "B", ""], ["B", "A", ""], ["C", "A", ""]], { A: { status: "missing", candidates: [] }, B: { status: "missing", candidates: [] } });
+    a = plan.analyze(j);
+    eq(a.conflicts.map((c) => [c.key, c.rows]), [["cycle:1:1", [1]]]);
+    ok(a.conflicts[0].message.includes("rows 3 → 2 → 3"), a.conflicts[0].message);
+    j.decisions.set("cycle:1:1", { action: "empty" });
+    a = plan.analyze(j);
+    eq(a.conflicts.length, 0);
+    eq([...a.levels], [[0, 1], [2, 2]]);
+    eq(plan.build(j, a, { level: 0 }).rows, [["B", ""]]);
+    j.decisions.set("cycle:1:1", { action: "skip", rows: [1] });
+    a = plan.analyze(j);
+    eq([a.conflicts.length, a.stats.skip], [1, 1], "B skipped: A's parent is looked up in Odoo again");
+    eq(a.conflicts[0].key, "m2o:1:b");
+
+    // a long chain doesn't overflow the stack
+    const chain = Array.from({ length: 20000 }, (_, i) => [`N${i}`, i ? `N${i - 1}` : "", ""]);
+    j = selfJob(chain, Object.fromEntries(chain.slice(1).map((r) => [r[1], { status: "missing", candidates: [] }])));
+    a = plan.analyze(j);
+    eq([a.conflicts.length, a.levels.get(19999)], [0, 19999]);
+});
+
+// A fake Odoo without base_import: load() records what it is sent, new ids from 100.
+function loader(onLoad) {
+    const calls = [];
+    let next = 100;
+    return {
+        calls,
+        async call(model, method, args) {
+            if (model === "base_import.import") throw new Error("no base_import");
+            if (method === "load") {
+                calls.push([args[0], args[1]]);
+                return onLoad ? onLoad(args) : { ids: args[1].map(() => next++), messages: [] };
+            }
+            throw new Error(`unexpected ${model}.${method}`);
+        },
+    };
+}
+const XMLID = /^__import__\.oi_[0-9a-z]+_(\d+)$/;
+const lineOf = (x) => Number((XMLID.exec(x) || [])[1]);
+
+await atest("in-file links: batch-wise import, links sent as external ids, parents first", async () => {
+    const j = selfJob([["John", "Acme", ""], ["Acme", "", ""], ["Kid", "John", ""], ["Solo", "", ""]], { Acme: { status: "missing", candidates: [] }, John: { status: "missing", candidates: [] } });
+    const client = loader();
+    const r = await execute.createExecutor(client).run(j, plan.analyze(j), { batchSize: 2 });
+    ok(r.ok, JSON.stringify(r.errors));
+    eq(client.calls.map((c) => c[0]), [["name", "parent_id/.id", "id"], ["name", "parent_id/id", "id"]]);
+    const [[, plain], [, linked]] = client.calls;
+    eq(plain.map((row) => row.slice(0, 2)), [["Acme", ""], ["Solo", ""]]);
+    eq([plain[1][2], linked.map((row) => row[0])], ["", ["John", "Kid"]], "the user's batch size; a child after its parent");
+    const [xAcme, xJohn] = [plain[0][2], linked[0][2]];
+    eq([lineOf(xAcme), lineOf(xJohn), linked[0][1], linked[1][1], linked[1][2]], [3, 2, xAcme, xJohn, ""]);
+    eq(r.created, [100, 101, 102, 103]);
+});
+
+await atest("in-file links: a dry run sends one pass and leaves the links empty", async () => {
+    const j = selfJob([["John", "Acme", ""], ["Acme", "", ""]], { Acme: { status: "missing", candidates: [] } });
+    const calls = [];
+    const client = {
+        async call(model, method, args, kwargs) {
+            if (method === "fields_get") return { file: { help: "" } };
+            if (method === "create") return 1;
+            if (method === "execute_import") {
+                calls.push([args[1], kwargs]);
+                return { ids: [], messages: [] };
+            }
+            throw new Error(`unexpected ${model}.${method}`);
+        },
+    };
+    await execute.createExecutor(client).run(j, plan.analyze(j), { dryrun: true });
+    eq(calls, [[["name", "parent_id/.id"], { dryrun: true }]]);
+});
+
+await atest("in-file links: an updated record links to a new one, after the creations", async () => {
+    const client = loader((args) => ({ ids: args[1].map((r) => (args[0].includes(".id") ? Number(r[args[0].indexOf(".id")]) : 100)), messages: [] }));
+    const j = selfJob([["John", "Acme", "john@acme.test"], ["Acme", "", "info@acme.test"]], { Acme: { status: "missing", candidates: [] } });
+    j.key = { col: 2, field: "email", mode: "update" };
+    j.existing = new Map([["john@acme.test", [{ id: 7, label: "John" }]]]);
+    const a = plan.analyze(j);
+    eq([[...a.inFile], [...a.levels]], [[["1:0:acme", 1]], [[0, 1]]]);
+    const r = await execute.createExecutor(client).run(j, a);
+    ok(r.ok, JSON.stringify(r.errors));
+    eq(client.calls.map((c) => c[0]), [["name", "parent_id/.id", "email", "id"], ["name", "parent_id/id", "email", ".id"]]);
+    const xAcme = client.calls[0][1][0][3];
+    eq(lineOf(xAcme), 3);
+    eq(client.calls[1][1], [["John", xAcme, "john@acme.test", "7"]]);
+    eq([r.created, r.updated], [[100], [7]]);
+});
+
+await atest("in-file links: a row's own External ID is the one linked to", async () => {
+    const j = selfJob([["John", "Acme", "", ""], ["Acme", "", "", "acme"], ["Beta", "", "", ""], ["Ann", "Beta", "", ""]],
+        { Acme: { status: "missing", candidates: [] }, Beta: { status: "missing", candidates: [] } }, [["External ID", ["id"]]]);
+    const client = loader();
+    await execute.createExecutor(client).run(j, plan.analyze(j));
+    eq(client.calls.map((c) => c[0]), [["name", "parent_id/.id", "id"], ["name", "parent_id/id", "id"]]);
+    eq(client.calls[0][1][0], ["Acme", "", "acme"]);
+    eq(lineOf(client.calls[0][1][1][2]), 4, "a blank External ID gets a generated one");
+    eq(client.calls[1][1].map((row) => row.slice(0, 2)), [["John", "__import__.acme"], ["Ann", client.calls[0][1][1][2]]]);
+});
+
+// Contacts linked to contacts by a many2many column: values may name rows of the file and
+// existing records alike.
+function relatedJob(rows, resolutions) {
+    const j = job(["Name", "Related"], rows, [["name"], null]);
+    const related = F("related_ids", "many2many", "Related", { relation: "res.partner" });
+    j.mapping[1] = { col: 1, path: ["related_ids"], fields: [related], status: "auto", score: 1, candidates: [] };
+    j.rel.set(1, { field: related, mode: "name", sep: "," });
+    j.resolutions.set(1, new Map(Object.entries(resolutions)));
+    j.inFile = plan.fileIndex(j, ["name"]);
+    return j;
+}
+
+test("in-file links: a many2many naming several rows of the file links to each of them", () => {
+    const j = relatedJob([["Ann", "Bob, Cid"], ["Bob", ""], ["Cid", "Bob"]], { Bob: { status: "missing", candidates: [] }, Cid: { status: "missing", candidates: [] } });
+    const a = plan.analyze(j);
+    eq(a.conflicts.length, 0);
+    eq([...a.inFile], [["1:0:bob", 1], ["1:0:cid", 2], ["1:2:bob", 1]]);
+    eq([...a.levels].sort(), [[0, 2], [2, 1]]);
+    eq(plan.build(j, a, { level: 2, rowIds: new Map([[1, 10], [2, 11]]) }).rows, [["Ann", "10,11"]]);
+    const xmlids = plan.xmlids(j, a, "t");
+    const m = plan.build(j, a, { linked: true, xmlids });
+    eq([m.mixed, m.fields, m.rows], [false, ["name", "related_ids/id", "id"], [["Cid", "__import__.oi_t_3", "__import__.oi_t_4"], ["Ann", "__import__.oi_t_3,__import__.oi_t_4", ""]]]);
+});
+
+const MIXED = { Bob: { status: "missing", candidates: [] }, Zed: { status: "ok", id: 50, candidates: [C(50, "Zed")] } };
+
+await atest("in-file links: a link column also naming existing records falls back to rounds", async () => {
+    const j = relatedJob([["Ann", "Bob, Zed"], ["Bob", ""]], MIXED);
+    const client = loader();
+    const r = await execute.createExecutor(client).run(j, plan.analyze(j));
+    ok(r.ok, JSON.stringify(r.errors));
+    eq(client.calls, [[["name", "related_ids/.id"], [["Bob", ""]]], [["name", "related_ids/.id"], [["Ann", "100,50"]]]]);
+});
+
+await atest("in-file links: after a dropped connection, the links still resolve by external id", async () => {
+    const executed = [];
+    const client = {
+        async call(model, method, args) {
+            if (model === "base_import.import" && method === "fields_get") return { file: { help: "" } };
+            if (model === "base_import.import" && method === "create") return 1;
+            if (model === "base_import.import" && method === "search_read") return [{ create_date: "2026-01-01 00:00:00", create_uid: [2, "Admin"] }];
+            if (model === "base_import.import" && method === "execute_import") {
+                executed.push([args[1], args[2]]);
+                if (executed.length === 1) throw Object.assign(new Error("dropped"), { title: "Network error" });
+                return { ids: [300], messages: [] };
+            }
+            // Acme's batch was saved along with a contact of its own: 2 records for 1 row.
+            if (model === "res.partner" && method === "search") return [200, 201];
+            throw new Error(`unexpected ${model}.${method}`);
+        },
+    };
+    const j = selfJob([["John", "Acme", ""], ["Acme", "", ""]], { Acme: { status: "missing", candidates: [] } });
+    const r = await execute.createExecutor(client).run(j, plan.analyze(j));
+    eq(executed.length, 2, "the recovered batch isn't sent again");
+    eq(executed[1][0], ["name", "parent_id/id"]);
+    eq(r.created, [200, 201, 300]);
+    eq(r.warnings.length, 1, "only the dropped connection's");
+});
+
+await atest("in-file links: rounds after a dropped connection that can't be mapped back leave the link empty, with a warning", async () => {
+    let n = 0;
+    const client = {
+        async call(model, method, args) {
+            if (model === "base_import.import" && method === "fields_get") return { file: { help: "" } };
+            if (model === "base_import.import" && method === "create") return 1;
+            if (model === "base_import.import" && method === "search_read") return [{ create_date: "2026-01-01 00:00:00", create_uid: [2, "Admin"] }];
+            if (model === "base_import.import" && method === "execute_import") {
+                if (++n === 1) throw Object.assign(new Error("dropped"), { title: "Network error" });
+                return { ids: [300], messages: [] };
+            }
+            if (model === "res.partner" && method === "search") return [200, 201];
+            throw new Error(`unexpected ${model}.${method}`);
+        },
+    };
+    const j = relatedJob([["Ann", "Bob, Zed"], ["Bob", ""]], MIXED);
+    const r = await execute.createExecutor(client).run(j, plan.analyze(j));
+    eq([n, r.created], [2, [200, 201, 300]]);
+    eq(r.warnings.map((w) => w.line), [null, 2]);
+    ok(/1 link to records of this file couldn't be set .*rows 2\./.test(r.warnings[1].message), r.warnings[1].message);
+});
+
 test("base64 handles unicode", () => {
     eq(atob(execute.base64("é")), "Ã©");
 });
@@ -579,4 +828,301 @@ test("sample data: typos made from real names", () => {
     eq(t("Mitchell Admin"), "Micthell Admin");
     ok(t("Spain", new Set(["sapin"])) !== "Spain", "never the name itself");
 });
+// ---------------------------------------------------------------------------
+// stock counts (stock.quant)
+const QUANT = [
+    schema.ID_FIELD,
+    F("product_id", "many2one", "Product", { relation: "product.product", required: true }),
+    F("location_id", "many2one", "Location", { relation: "stock.location", required: true }),
+    F("lot_id", "many2one", "Lot/Serial Number", { relation: "stock.lot" }),
+    F("package_id", "many2one", "Package", { relation: "stock.package" }),
+    F("owner_id", "many2one", "Owner", { relation: "res.partner" }),
+    F("user_id", "many2one", "Assigned To", { relation: "res.users" }),
+    F("inventory_quantity", "float", "Counted"),
+    F("inventory_quantity_auto_apply", "float", "Inventoried Quantity"),
+    F("inventory_date", "date", "Scheduled Date"),
+    schema.DBID_FIELD,
+];
+const OK = (id) => ({ status: "ok", id, candidates: [C(id, String(id))] });
+
+function countJob(headers, rows, mapped, resolutions = {}) {
+    const j = plan.newJob("stock.quant", { headers, rows, lines: rows.map((_, i) => i + 2) });
+    j.profiles = headers.map((_, c) => profile.profileColumn(rows.map((r) => r[c])));
+    const byName = new Map(QUANT.map((f) => [f.name, f]));
+    j.mapping = headers.map((_, col) => {
+        const path = mapped[col];
+        return path ? { col, path, fields: path.map((n) => byName.get(n)), status: "auto", score: 1, candidates: [] } : { col, path: null, status: "none", candidates: [] };
+    });
+    for (const m of plan.active(j)) {
+        const r = plan.relationOf(m);
+        if (r) j.rel.set(m.col, { ...r, sep: "," });
+    }
+    for (const [col, res] of Object.entries(resolutions)) j.resolutions.set(Number(col), new Map(Object.entries(res)));
+    OdooImport.inventory.ensure(j);
+    return j;
+}
+const quant = (id, product, location, qty, extra = {}) => ({
+    id, product_id: [product, `P${product}`], location_id: [location, `L${location}`], lot_id: extra.lot || false, package_id: extra.package || false, owner_id: false,
+    quantity: qty, reserved_quantity: extra.reserved || 0, inventory_quantity: extra.counted || 0, inventory_quantity_set: !!extra.set, user_id: extra.user || false,
+});
+const PRODUCTS = new Map([[1, { label: "Desk", tracking: "none", storable: true }], [2, { label: "Chair", tracking: "lot", storable: true }], [3, { label: "Service", tracking: "none", storable: false }]]);
+const LOCATIONS = new Map([[10, { label: "WH/Stock", usage: "internal", company: 1 }], [11, { label: "Partners/Customers", usage: "customer", company: null }]]);
+
+test("stock count: column choice, lot names left to the count, key put aside", () => {
+    const inv = OdooImport.inventory;
+    const j = countJob(["Product", "Lot", "Location", "Qty"], [["Desk", "", "WH/Stock", "5"], ["Chair", "L-NEW", "WH/Stock", "2"]],
+        [["product_id"], ["lot_id"], ["location_id"], ["inventory_quantity"]],
+        { 0: { Desk: OK(1), Chair: OK(2) }, 1: { "L-NEW": { status: "missing", candidates: [] } }, 2: { "WH/Stock": OK(10) } });
+    eq(inv.columns(j), { product: 0, location: 2, lot: 1, package: null, owner: null, qty: 3, lotByName: true });
+    eq(plan.analyze(j).conflicts.length, 0, "a lot name is matched per product by the count, not by name alone");
+    eq(inv.problems(j), []);
+    j.key = { col: 0, field: "id", mode: "update" };
+    inv.setMode(j, "overwrite");
+    eq(j.key, null);
+    eq(inv.setMode(j, "default"), true, "the key comes back for Odoo's default flow");
+    eq(j.key.field, "id");
+    eq(plan.analyze(j).conflicts.map((c) => c.key), ["m2o:1:l-new"], "default flow: Odoo's own lot lookup");
+    const k = countJob(["Product", "Lot"], [["Desk", ""]], [["product_id"], ["lot_id"]], { 0: { Desk: OK(1) } });
+    eq(inv.problems(k), ["Map a column to Counted Quantity.", "Map a column to Location, or set one location for every row (Review step)."]);
+});
+
+test("stock count: rows matched to quants, summed, new lots, blanks and errors", () => {
+    const inv = OdooImport.inventory;
+    const rows = [
+        ["Desk", "", "WH/Stock", "5"], // quant 100: 3 on hand -> 5
+        ["Chair", "L1", "WH/Stock", "2"], // quant 101 (lot 7)
+        ["Chair", "l1", "WH/Stock", "1"], // same lot (case), summed: 3
+        ["Chair", "L2", "WH/Stock", "4"], // L2 exists for another product only: new lot
+        ["Desk", "", "WH/Stock", ""], // no quantity: left out
+        ["Service", "", "WH/Stock", "1"], // not storable
+        ["Desk", "", "Customers", "1"], // not internal
+        ["Desk", "", "WH/Stock", "-1"], // negative
+    ];
+    const j = countJob(["Product", "Lot", "Location", "Qty"], rows, [["product_id"], ["lot_id"], ["location_id"], ["inventory_quantity"]],
+        { 0: { Desk: OK(1), Chair: OK(2), Service: OK(3) }, 2: { "WH/Stock": OK(10), Customers: OK(11) } });
+    const a = plan.analyze(j);
+    eq(a.conflicts.length, 0);
+    const read = inv.readRows(j, a);
+    eq(read.blank, [4]);
+    eq(read.errors.map((e) => e.row), [7]);
+    const quants = [quant(100, 1, 10, 3), quant(101, 2, 10, 6, { lot: [7, "L1"], reserved: 4 }), quant(102, 1, 10, 0, { package: [5, "PK"] })];
+    const lots = [{ id: 7, name: "L1", product_id: [2, "Chair"] }, { id: 8, name: "L2", product_id: [1, "Desk"] }];
+    const p = inv.compute({ mode: "listed", ...read, products: PRODUCTS, locations: LOCATIONS, lots: lots.filter((l) => l.product_id[0] === 2), quants, has: { lot: true, package: false, owner: false }, lines: j.table.lines });
+    eq(p.errors.map((e) => e.row).sort(), [5, 6, 7]);
+    eq(p.lines.map((l) => [l.action, l.quant && l.quant.id, l.rows, l.onHand, l.counted, l.lotLabel]), [
+        ["update", 100, [0], 3, 5, ""],
+        ["update", 101, [1, 2], 6, 3, "L1"],
+        ["create", null, [3], 0, 4, "L2"],
+    ]);
+    eq(p.newLots, [{ name: "L2", product: 2, company: 1 }]);
+    eq([p.stats.update, p.stats.create, p.stats.zero, p.stats.up, p.stats.down, p.stats.net, p.stats.blank], [2, 1, 0, 2, 1, 3, 1]);
+    const titles = p.warnings.map((w) => w.title);
+    ok(titles.includes("2 rows for Chair (L1) in WH/Stock"), "summed rows");
+    ok(titles.includes("Chair (L1) in WH/Stock: counted below the reserved quantity"), "reserved");
+    ok(titles.some((t) => t.startsWith("1 row has no counted quantity")), "blank rows");
+    eq(p.zeros, [], "listed: nothing else is touched");
+});
+
+test("stock count: overwrite counts the rest of the location 0; add adds to on hand", () => {
+    const inv = OdooImport.inventory;
+    const entries = [{ row: 0, product: 1, location: 10, lot: null, lotName: "", package: null, owner: null, qty: 2 }];
+    const quants = [
+        quant(100, 1, 10, 3), // counted 2
+        quant(103, 1, 10, 1), // a duplicate quant of the same key (an earlier import): counted 0
+        quant(104, 2, 10, 5, { lot: [7, "L1"] }), // not in the sheet: 0
+        quant(105, 1, 10, 4, { package: [5, "PK"] }), // Desk in a package, no Package column: kept
+        quant(106, 2, 10, 0), // nothing there, nothing counted: left alone
+        quant(107, 2, 10, 0, { set: true, counted: 9 }), // an open count of 9: counted 0
+        quant(99, 1, 10, 0), // an empty duplicate of 100: left to Odoo's cleanup, and not the one counted
+    ];
+    const base = { entries, products: PRODUCTS, locations: LOCATIONS, quants, has: { lot: true, package: false, owner: false }, lines: [2] };
+    const o = inv.compute({ ...base, mode: "overwrite" });
+    eq(o.lines.map((l) => [l.quant.id, l.others.map((q) => q.id), l.onHand, l.counted]), [[100, [103], 4, 2]]);
+    eq(o.zeros.map((z) => [z.quant.id, z.counted]), [[104, 0], [107, 0]]);
+    eq([o.stats.zero, o.stats.net, o.stats.total], [3, -7, 4]);
+    ok(o.warnings.some((w) => w.title === "P1 in L10: 4 more not counted" && /packages/.test(w.message)), "packaged stock kept");
+    ok(o.warnings.some((w) => /split over 2 quants/.test(w.title)), "duplicate quants");
+    const add = inv.compute({ ...base, mode: "add" });
+    eq(add.lines.map((l) => [l.onHand, l.counted, l.diff]), [[4, 6, 2]]);
+    eq(add.zeros, []);
+});
+
+test("stock count: a tracked product needs its lot, an untracked one takes none", () => {
+    const inv = OdooImport.inventory;
+    const SERIAL = new Map([...PRODUCTS, [4, { label: "Laptop", tracking: "serial", storable: true }]]);
+    const e = (row, product, qty, extra = {}) => ({ row, product, location: 10, lot: null, lotName: "", lotText: "", package: null, owner: null, qty, ...extra });
+    const entries = [
+        e(0, 2, 3), // Chair (lots) without a lot: error
+        e(1, 2, 0), // Chair counted 0 without a lot: clears stock from before lots, fine
+        e(2, 4, 1), // Laptop (serials) without a serial: error
+        e(3, 1, 2, { lotName: "L1", lotText: "L1" }), // Desk (no lots) with a lot name: error
+        e(4, 1, 2, { lot: 7, lotText: "L1" }), // Desk with a lot picked by id: error
+        e(5, 2, 1, { lotName: "L1", lotText: "L1" }), // Chair with its lot: fine
+        e(6, 1, 2), // Desk without a lot: fine
+    ];
+    const lots = [{ id: 7, name: "L1", product_id: [2, "Chair"] }];
+    const p = inv.compute({ mode: "listed", entries, products: SERIAL, locations: LOCATIONS, lots, quants: [], has: { lot: true, package: false, owner: false }, lines: [2, 3, 4, 5, 6, 7, 8] });
+    eq(p.errors.map((x) => [x.row, x.line]), [[0, 2], [2, 4], [3, 5], [4, 6]]);
+    ok(/Chair is tracked by lots: the row has no lot/.test(p.errors[0].message), p.errors[0].message);
+    ok(/Laptop is tracked by serial numbers/.test(p.errors[1].message), p.errors[1].message);
+    ok(/Desk has no lots or serial numbers, but the row gives “L1”/.test(p.errors[2].message), p.errors[2].message);
+    eq(p.lines.map((l) => l.rows), [[1], [5], [6]]);
+    eq(p.warnings.filter((w) => /lots|serial/.test(w.title)), [], "no lot warnings left: they're errors now");
+    const none = inv.compute({ mode: "listed", entries: [e(0, 2, 3)], products: SERIAL, locations: LOCATIONS, quants: [], has: { lot: false, package: false, owner: false }, lines: [2] });
+    ok(/no Lot\/Serial column: map one/.test(none.errors[0].message), none.errors[0].message);
+});
+
+test("stock count: offered on the tested releases only (18.0, 19.0, 20.0)", () => {
+    const inv = OdooImport.inventory;
+    const v = (vi, server_version) => OdooImport.rpc.version({ server_version_info: vi, server_version });
+    eq([[18, 0], [19, 0], [20, 0]].map((x) => inv.tested(v(x))), [true, true, true]);
+    eq(inv.tested(v(["saas~18", 3, 0, "final", 0, ""])), false, "Odoo Online intermediate release");
+    eq(inv.tested(v(["saas~19", 1])), false);
+    eq([[17, 0], [16, 0], [21, 0]].map((x) => inv.tested(v(x))), [false, false, false]);
+    eq(inv.tested(v([], "")), false, "unknown version");
+    eq(inv.tested(null), false);
+});
+
+await atest("stock count: the only location fills in for every row, and leaves Odoo's default flow", async () => {
+    const inv = OdooImport.inventory;
+    const fake = ({ locs, multi, whs }) => ({ async call(model, method) {
+        if (model === "stock.location") return locs;
+        if (model === "res.users" && method === "has_group") { if (multi instanceof Error) throw multi; return multi; }
+        if (model === "stock.warehouse") return whs;
+        throw new Error(`${model}.${method}`);
+    } });
+    eq(await inv.soleLocation(fake({ locs: [{ id: 8, display_name: "WH/Stock" }] }), 2), { id: 8, label: "WH/Stock", why: "the only stock location" });
+    const two = [{ id: 8, display_name: "WH/Stock" }, { id: 9, display_name: "WH/Stock/Shelf 1" }];
+    eq(await inv.soleLocation(fake({ locs: two, multi: false, whs: [{ id: 1, lot_stock_id: [8, "WH/Stock"] }] }), 2), { id: 8, label: "WH/Stock", why: "the warehouse's stock location" });
+    eq(await inv.soleLocation(fake({ locs: two, multi: true }), 2), null, "storage locations on: the sheet must say");
+    eq(await inv.soleLocation(fake({ locs: two, multi: new Error("no access") }), 2), null);
+    eq(await inv.soleLocation(fake({ locs: two, multi: false, whs: [{ id: 1, lot_stock_id: [8, "A/Stock"] }, { id: 2, lot_stock_id: [12, "B/Stock"] }] }), 2), null);
+    eq(await inv.soleLocation(fake({ locs: [] }), 2), null);
+
+    const j = countJob(["Product", "Qty"], [["Desk", "5"]], [["product_id"], ["inventory_quantity"]], { 0: { Desk: OK(1) } });
+    ok(inv.problems(j).some((x) => /Location/.test(x)), "no location yet");
+    j.count.sole = { id: 8, label: "WH/Stock", why: "the only stock location" };
+    j.defaults.set("location_id", inv.soleDefault(j.count.sole));
+    eq(inv.problems(j), []);
+    eq(inv.readRows(j, plan.analyze(j)).entries.map((x) => x.location), [8]);
+    inv.setMode(j, "default");
+    eq(j.defaults.has("location_id"), false, "Odoo's default flow: not the user's choice there");
+    inv.setMode(j, "overwrite");
+    eq(j.defaults.get("location_id").out, "8", "back in a count: filled in again");
+    j.defaults.set("location_id", { out: "9", label: "WH/Stock/Shelf 1", path: "location_id/.id" });
+    inv.setMode(j, "default");
+    eq(j.defaults.get("location_id").out, "9", "a location the user picked stays");
+});
+
+await atest("stock count: run sends updates with .id and creations with the quant key, never twice", async () => {
+    const inv = OdooImport.inventory;
+    const calls = [];
+    const executor = { async batch(model, matrix, rows, dryrun) { calls.push({ model, fields: matrix.fields, rows, dryrun }); return { ids: rows.map((_, k) => 500 + calls.length * 10 + k), messages: [] }; } };
+    const client = { async call(model, method, args) { calls.push({ model, method, args }); return args[0].map((_, k) => 900 + k); } };
+    const q = quant(100, 1, 10, 3, { set: true, counted: 8, user: [6, "Ann"] });
+    const plan1 = {
+        mode: "overwrite",
+        lines: [
+            { action: "update", quant: q, others: [quant(103, 1, 10, 1)], product: 1, location: 10, lot: null, package: null, owner: null, counted: 2, rows: [0], productLabel: "Desk", locationLabel: "WH/Stock", lotLabel: "" },
+            { action: "create", quant: null, others: [], product: 2, location: 10, lot: null, newLot: "L9", package: null, owner: null, counted: 4, rows: [1], productLabel: "Chair", locationLabel: "WH/Stock", lotLabel: "L9" },
+        ],
+        zeros: [{ action: "zero", quant: quant(104, 2, 10, 5), others: [], counted: 0, rows: [], productLabel: "P2", locationLabel: "L10", lotLabel: "" }],
+        newLots: [{ name: "L9", product: 2, company: 1 }],
+    };
+    const dry = await inv.run(client, executor, plan1, { dryrun: true, uid: 2 });
+    ok(dry.ok, "dry run ok");
+    eq(calls.some((c) => c.method === "create"), false, "no lot is created by a check");
+    eq(calls.filter((c) => c.fields).map((c) => [c.fields, c.rows]), [
+        [[".id", "inventory_quantity", "user_id/.id"], [["100", "2", "2"], ["103", "0", "2"], ["104", "0", "2"]]],
+        [["product_id/.id", "location_id/.id", "inventory_quantity", "user_id/.id"], [["2", "10", "4", "2"]]],
+    ], "a check leaves the new lot empty");
+    calls.length = 0;
+    const r = await inv.run(client, executor, plan1, { uid: 2 });
+    eq(calls[0], { model: "stock.lot", method: "create", args: [[{ name: "L9", product_id: 2, company_id: 1 }]] });
+    eq(calls[2].fields, ["product_id/.id", "location_id/.id", "lot_id/.id", "inventory_quantity", "user_id/.id"]);
+    eq(calls[2].rows, [["2", "10", "900", "4", "2"]]);
+    eq([r.created, r.updated.length, r.count.created.length, r.count.zeroed], [[], 3, 1, 2]);
+    eq(r.count.prev[0], { id: r.updated[0], set: true, qty: 8, user: 6 });
+    eq(r.deps, [{ relation: "stock.lot", ids: [900] }]);
+});
+
+await atest("stock count: undo restores open counts, leaves applied ones", async () => {
+    const inv = OdooImport.inventory;
+    const calls = [];
+    const client = { async call(model, method, args) {
+        calls.push([model, method, args]);
+        if (method === "search_read") return [{ id: 1, inventory_quantity_set: true }, { id: 2, inventory_quantity_set: true }, { id: 4, inventory_quantity_set: true }];
+        return true;
+    } };
+    const errors = await inv.undo(client, { count: { prev: [{ id: 1, set: false, qty: 0, user: null }, { id: 2, set: true, qty: 8, user: 6 }, { id: 3, set: false, qty: 0, user: null }], created: [4] }, deps: [] });
+    eq(calls.slice(1), [["stock.quant", "action_clear_inventory_quantity", [[4, 1]]], ["stock.quant", "write", [[2], { inventory_quantity: 8, user_id: 6 }]], ["stock.quant", "action_view_inventory", []]]);
+    eq(errors, ["1 count was already applied in Odoo and can't be undone here."]);
+});
+
+await atest("stock count: apply only the waiting counts, in batches, leaving moved stock for review", async () => {
+    const inv = OdooImport.inventory;
+    const calls = [];
+    const client = { async call(model, method, args, kwargs, context) {
+        calls.push([method, args, context]);
+        if (method === "search_read") return [1, 2, 3, 4, 5].map((id) => ({ id, inventory_quantity_set: id !== 3, is_outdated: id === 4 }));
+        if (method === "action_apply_inventory" && args[0].includes(5)) return { type: "ir.actions.act_window", res_model: "stock.inventory.conflict" };
+        return true;
+    } };
+    const entry = { count: { prev: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }], created: [5] } };
+    const r = await inv.apply(client, entry, { reason: "Count A", batchSize: 2 });
+    eq(calls.slice(1), [["action_apply_inventory", [[1, 2]], { inventory_name: "Count A" }], ["action_apply_inventory", [[5]], { inventory_name: "Count A" }]]);
+    eq([r.applied, r.outdated, r.gone, r.errors], [[1, 2], [4, 5], 1, []]);
+});
+
+await atest("stock count: apply stops on Odoo's refusal, keeping what was applied", async () => {
+    const inv = OdooImport.inventory;
+    let n = 0;
+    const client = { async call(model, method) {
+        if (method === "search_read") return [1, 2].map((id) => ({ id, inventory_quantity_set: true, is_outdated: false }));
+        if (n++) throw new Error("Only a stock manager can do that");
+        return true;
+    } };
+    const r = await inv.apply(client, { count: { prev: [{ id: 1 }, { id: 2 }], created: [] } }, { batchSize: 1 });
+    eq([r.applied, r.errors], [[1], ["Only a stock manager can do that"]]);
+});
+
+await atest("stock count: a count sheet has one row per stock key, split quants added up", async () => {
+    const client = { async call(model, method) {
+        if (model === "stock.quant") return [quant(1, 1, 10, 10), quant(2, 1, 10, -2), quant(3, 2, 10, 5, { lot: [7, "L1"] }), quant(4, 2, 10, 0)];
+        if (model === "product.product") return [{ id: 1, default_code: "DESK" }, { id: 2, default_code: "CHAIR" }];
+        throw new Error(`${model}.${method}`);
+    } };
+    const t = await OdooImport.inventory.countSheet(client, { locations: [10] });
+    eq(t.sheets[0].rows, [["CHAIR", "L1", "L10", 5, null], ["DESK", "", "L10", 8, null]]);
+});
+
+await atest("stock count: a count sheet maps back to the right fields", async () => {
+    const fields = QUANT;
+    const headers = ["Product", "Lot/Serial Number", "Location", "Package", "Owner", "On Hand (not imported)", "Counted Quantity"];
+    const rows = [["FURN_1", "L1", "WH/Stock", "", "", "3", ""], ["FURN_2", "", "WH/Stock", "", "", "1", ""]];
+    const map = await columns.automap({ headers, profiles: headers.map((_, c) => profile.profileColumn(rows.map((r) => r[c]))), fields, subFields: async () => [] });
+    eq(map.map((m) => m.path && m.path.join("/")), ["product_id", "lot_id", "location_id", "package_id", "owner_id", null, "inventory_quantity"]);
+    const plain = ["Item", "Serial", "Bin", "Qty"];
+    const map2 = await columns.automap({ headers: plain, profiles: plain.map(() => profile.profileColumn(["x"])), fields, subFields: async () => [] });
+    eq(map2.map((m) => m.path && m.path.join("/")), ["product_id", "lot_id", "location_id", "inventory_quantity"]);
+});
+
+// ---------------------------------------------------------------------------
+// export columns
+const LIST_ARCH = `<list><field name="name"/><field name="email"/><field name="phone" optional="show"/><field name="city" optional="hide"/><field name="vat" optional="hide"/><field name="comment" column_invisible="1"/></list>`;
+const fakeViews = (arch) => ({ async call(model, method) { if (method === "get_views") return { views: { list: { arch } } }; throw new Error(method); } });
+const fakeSchemas = { async load() { return { fields: new Map(PARTNER.map((f) => [f.name, { ...f, importable: f.name !== "email", store: true }])) }; } };
+const onOff = (list) => list.map((x) => `${x.on ? "+" : "-"}${x.path.join("/")}`);
+
+await atest("export columns: the list on screen first, its hidden optional columns unticked", async () => {
+    const client = fakeViews(LIST_ARCH);
+    eq(onOff(await OdooImport.export.defaultPaths(client, fakeSchemas, "res.partner", "data")), ["+name", "+email", "+phone", "-city", "-vat"]);
+    // the user switched Phone off and City on in the list's column menu, and moved Email last
+    const page = { shown: ["name", "city", "email"], hidden: ["phone", "vat"] };
+    eq(onOff(await OdooImport.export.defaultPaths(client, fakeSchemas, "res.partner", "data", page)), ["+name", "+city", "+email", "-phone", "-vat"]);
+    // re-import: External ID, editable shown columns, required fields; editable hidden ones unticked
+    eq(onOff(await OdooImport.export.defaultPaths(client, fakeSchemas, "res.partner", "reimport", page)), ["+id", "+name", "+city", "-phone", "-vat"]);
+    eq(await OdooImport.export.listViewColumns(client, "res.partner"), { shown: ["name", "email", "phone"], hidden: ["city", "vat"] });
+});
+
 finish();

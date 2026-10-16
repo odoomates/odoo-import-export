@@ -70,6 +70,12 @@
     product_uom_qty: ["quantity", "qty", "ordered qty", "ordered quantity", "units", "qté", "menge", "cantidad"],
     product_qty: ["quantity", "qty", "ordered qty"],
     quantity: ["quantity", "qty"],
+    // stock counts (stock.quant)
+    inventory_quantity: ["counted quantity", "counted qty", "counted", "count", "qty counted", "physical quantity", "physical qty", "physical count", "stock count", "quantity", "qty", "stock", "stock qty"],
+    lot_id: ["lot", "serial", "serial number", "lot number", "lot no", "serial no", "lot serial", "lot/serial", "batch", "batch number", "sn"],
+    location_id: ["location", "stock location", "bin", "rack", "shelf"],
+    package_id: ["package", "pallet", "box"],
+    owner_id: ["owner", "consignor"],
     price_unit: ["unit price", "price", "price per unit", "rate"],
     discount: ["discount", "disc", "discount %", "remise"],
     tax_id: ["taxes", "tax", "vat rate"],

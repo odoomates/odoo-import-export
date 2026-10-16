@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Odoo Import Export",
   "short_name": "Import Export",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Import spreadsheets into any Odoo model with automatic matching and undo; export to Excel or CSV; chart any model.",
   "icons": {
     "16": "src/icons/icon-16.png",

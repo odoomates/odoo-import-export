@@ -78,6 +78,21 @@ and says why (the same for missing access rights). Records to create are created
 values that don't fit the field (not a date, not one of the allowed choices), required fields left
 empty, dates that read both ways, records matching several existing ones. Warnings (archived records,
 duplicate keys in the file, required fields without a column) don't block anything.
+
+**Records of the same file**: a column linking to the model being imported (a contact's *Related
+Company*, a category's *Parent Category*) may name a row of the file itself, above or below. Such
+values are matched to the file's rows by name, by an alternate key (e-mail, reference…) or, for
+`parent_id/id` columns, by the External ID column, and aren't reported as not found. A row
+that updates an existing record links to that record. Rows linking to new rows are imported after
+them, in the batches you set (**Rows per batch**): the rows they link to get an External ID (their
+own, or a generated `__import__.oi_…`) and the links are sent as External IDs, which Odoo resolves
+as it imports, within a batch or across batches. When the same column also names existing records
+(a many2many mixing both), the import goes in rounds instead, each after the records it links to.
+*Check with Odoo* leaves these links empty, since every check is rolled back. A
+name shared by several rows links to the first one (with a warning). Rows pointing to each other
+in a circle (A → B → A) get a conflict for the row closing the circle: leave that link empty or
+skip the row.
+
 Keyboard: **↑/↓** move, **1–5** pick a suggestion, **C** create, **E** leave empty, **S** skip.
 **Preview data** shows the file with every cell tinted by what will happen to it.
 
@@ -90,6 +105,41 @@ Odoo would refuse with its line number. You can skip those rows or download them
 then runs in batches (500 rows by default) with a progress bar and a stop button. *Undo* deletes the
 records the import created, including linked records it created (tags, countries…); records it
 updated keep their new values. **History** lists past imports per database with their undo.
+
+**Stock counts (Inventory › Physical Inventory, `stock.quant`)**: a sheet of *Product, Lot/Serial,
+Location, Counted quantity* goes straight in, without exporting the quants with their IDs first. Odoo's own
+import can't do that: a row without an ID makes a second quant next to the one in stock. Review asks
+how the sheet updates the stock:
+
+| Option | What it does |
+|---|---|
+| **Update listed items only** (default) | each row sets the counted quantity of its product (and lot) in its location; nothing else changes |
+| **Overwrite location** | a full count: the rows set their count, everything else in the sheet's locations is counted 0 (sublocations too, if ticked) |
+| **Add to on hand** | counted = on hand + the sheet's quantity |
+| **Odoo default** | Odoo's import as for any other model |
+
+Rows are matched to their quant by product, location, lot, package and owner (lots by name, per
+product; new lot names are created). Several rows for the same stock are added up, and an empty
+counted cell leaves its stock alone (write 0 for what isn't there). Before anything is written, the
+Import step lists every stock line with on hand, counted and the difference, and warns about counts
+below the reserved quantity, serial numbers counted above 1, counts that replace someone's open
+count, and stock in packages or lots the sheet has no column for (left as
+it is). Duplicate quants made by an earlier import are counted 0 next to the real one, so the total
+is right. Refused per row (fix the file and upload it again, or leave those rows out): services,
+consumables, non-internal locations, a tracked product without its lot/serial (a count of 0 without
+one is allowed: it clears stock from before the product had lots) and a lot on a product without
+lots. No Location column? Pick one location for every row; when the user has only one stock
+location (or, without Storage Locations, one warehouse), it is filled in and shown. The import sets the counted quantities only:
+**the stock changes once they are applied (validated)**. After the import the panel offers both ways:
+**Review & apply in Odoo** opens Inventory › Physical Inventory with the *To Apply* filter on (going
+back from a line keeps it) to check the *Difference* column and click **Apply** there; **Apply now**
+applies them from the panel after a confirmation, with an *Inventory reason* on the stock moves, and reloads the Odoo view behind the panel (same filters) to show the new stock. Lines
+whose stock moved in Odoo since the count are left for review there (Odoo asks whether to keep the
+count). *Undo* puts back the counts not applied yet; applied ones have moved the stock. On the
+File step, **Counting a location?** downloads a count sheet of its stock with an empty *Counted
+Quantity* column, which maps back by itself. Offered on Odoo 18.0, 19.0 and 20.0 only, the releases
+it is tested on; on other versions (Odoo Online's saas~ releases included) `stock.quant` gets Odoo's
+own import like any other model.
 
 **Errors in plain language**: Odoo's messages are explained and grouped, e.g. *Customer is empty, but
 Odoo requires it · lines 3, 5, 9 +12*, with what to do (*map a column to it, or set one value for these
@@ -108,16 +158,21 @@ question: **what is the file for?**
 
 | | Data | For re-importing |
 |---|---|---|
-| Starting columns | the columns of the model's list view | External ID, name, the editable list-view columns, required fields |
+| Starting columns | the columns the list shows | External ID, name, the editable columns the list shows, required fields |
 | Headers | field labels ("Customer", "Country") | technical names (`partner_id`, `country_id`) |
 | Use | read, share, analyse | edit in Excel and import back: the External ID makes the import update the same records |
 
-Remove a column with **×**, reorder with **↑ ↓**, and add any field by typing its name; **›** (or
+The columns start from the list you are on, as it shows them: in its order, with the optional
+columns you switched on or off in its column menu (⋮); away from a list, from the model's default
+list view. The list's hidden optional columns follow, unticked. Untick a column to leave it out of
+the file (it stays listed, one click brings it back; **Tick all** / **Untick all**), reorder with
+**↑ ↓**, and add any field by typing its name; **›** (or
 →) opens a related record's fields, e.g. *Country › Country Code*. In a **Data** export, adding a lines field (*Order Lines*,
 *Invoice Lines*…) adds its useful columns at once (Product, Quantity, Unit Price, Subtotal…, from the
 lines table of the record's form), one row per line; re-import exports don't, since importing lines
-onto existing records adds them again. The list is remembered per model
-and purpose (**Reset to default** brings back the starting columns). Choose **Excel** (bold frozen
+onto existing records adds them again. Once you change it (tick,
+untick, reorder, add), the list is remembered per model and purpose; until then it follows the list on
+screen. **Reset to default** brings back the starting columns. Choose **Excel** (bold frozen
 header, filters, real numbers and dates) or **CSV** (UTF-8 with BOM, so Excel shows accents), then
 **Export N records**. Records are fetched 2,000 at a time through Odoo's own `export_data`, with
 progress and Cancel. Tags stay in one cell ("VIP, Gold"); order lines go on extra rows, the layout
@@ -217,7 +272,7 @@ apply. Odoo Import Export never sees your password.
 
 | Odoo | Status |
 |---|---|
-| 19.x, 19.5+ (master) | Tested: full end-to-end suite (38 checks) |
+| 19.x, 19.5+ (master) | Tested: full end-to-end suite (40 checks) |
 | 18.0 | Tested: full end-to-end suite |
 | 17.0 | Tested: full end-to-end suite |
 | 16.0 | Tested: full end-to-end suite |
@@ -254,6 +309,7 @@ No build step and no Node.js needed.
 python3 tools/build.py          # → dist/chrome/, dist/firefox/, dist/*.zip
 python3 tools/run_tests.py      # unit tests in headless Chrome
 python3 tests/e2e.py --url http://127.0.0.1:8069 --db mydb   # real imports, checked and undone
+python3 tests/e2e_stock.py --url http://127.0.0.1:8069 --db mydb   # stock counts (Odoo 18+ with Inventory)
 python3 tests/firefox.py --url http://127.0.0.1:8069 --db mydb   # the same essentials in Firefox
 python3 tools/make_fixtures.py  # regenerate tests/fixtures (needs openpyxl)
 python3 tools/make_icons.py     # regenerate src/icons (needs Pillow)

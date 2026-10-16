@@ -23,6 +23,7 @@ const FILES = [
   "src/shared/records.js",
   "src/shared/plan.js",
   "src/shared/execute.js",
+  "src/shared/inventory.js",
   "src/shared/xlsxwriter.js",
   "src/shared/domain.js",
   "src/shared/analyze.js",

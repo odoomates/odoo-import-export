@@ -51,8 +51,15 @@
 
   // Field names shown as columns in the model's default list view (Odoo 16: "tree").
   async function listViewFields(client, model) {
+    return (await listViewColumns(client, model)).shown;
+  }
+
+  // The columns of the model's default list view: shown, and hidden (optional="hide").
+  async function listViewColumns(client, model) {
     const root = await viewArch(client, model, ["list", "tree"]);
-    return root ? listColumns(root) : [];
+    if (!root) return { shown: [], hidden: [] };
+    const shown = listColumns(root);
+    return { shown, hidden: listColumns(root, () => true).filter((n) => !shown.includes(n)) };
   }
 
   // one2many columns put every line on its own row, and json/binary cells aren't readable:
@@ -82,20 +89,28 @@
     return names.map((n) => [o2m.name, n]);
   }
 
-  // Default columns for a purpose, as paths: [["id"], ["name"], ["country_id"], ...].
-  async function defaultPaths(client, schemas, model, purpose) {
+  /* Default columns for a purpose: [{path: ["name"], on: true}, ...]. They start from a list's
+   * columns: page = {shown, hidden} read from the list on screen (with the optional columns the
+   * user switched on or off), else the model's default list view. Shown columns are ticked; the
+   * hidden ones follow, unticked, ready to be ticked. */
+  async function defaultPaths(client, schemas, model, purpose, page = null) {
     const s = await schemas.load(model);
-    const listed = [...new Set(await listViewFields(client, model))].filter((n) => s.fields.has(n) && !SKIP.has(s.fields.get(n).type));
-    let names;
+    const cols = page && page.shown.length ? page : await listViewColumns(client, model);
+    const usable = (list) => [...new Set(list)].filter((n) => s.fields.has(n) && !SKIP.has(s.fields.get(n).type));
+    const [shown, hidden] = [usable(cols.shown), usable(cols.hidden)];
+    let on;
+    let off;
     if (purpose === "reimport") {
       const editable = (n) => s.fields.get(n).importable;
       const required = [...s.fields.values()].filter((f) => f.required && f.importable && f.type !== "one2many").map((f) => f.name);
       const name = s.fields.has("name") && editable("name") ? ["name"] : [];
-      names = ["id", ...new Set([...name, ...listed.filter(editable), ...required])];
+      on = ["id", ...new Set([...name, ...shown.filter(editable), ...required])];
+      off = hidden.filter(editable);
     } else {
-      names = listed.length ? listed : s.fields.has("name") ? ["name"] : ["display_name"];
+      on = shown.length ? shown : s.fields.has("name") ? ["name"] : ["display_name"];
+      off = hidden;
     }
-    return names.map((n) => [n]);
+    return [...on.map((n) => ({ path: [n], on: true })), ...off.filter((n) => !on.includes(n)).map((n) => ({ path: [n], on: false }))];
   }
 
   const TYPE = { integer: "number", float: "number", monetary: "number", boolean: "boolean", date: "date", datetime: "datetime" };
@@ -149,5 +164,5 @@
     return NS.xlsxwriter.workbook({ headers, rows, types, sheetName });
   }
 
-  NS.export = { listViewFields, linePaths, defaultPaths, describe, count, fetchRows, toBlob };
+  NS.export = { listViewFields, listViewColumns, linePaths, defaultPaths, describe, count, fetchRows, toBlob };
 })();

@@ -193,8 +193,8 @@ globalThis.E = {
   },
   decide(key, d) { E.job.decisions.set(key, d); return E.summary(); },
   confirm(col) { E.job.mapping[col].confirmed = true; return E.summary(); },
-  async run(dryrun) {
-    const r = await E.deps.executor.run(E.job, E.OI.plan.analyze(E.job), { dryrun });
+  async run(dryrun, batchSize) {
+    const r = await E.deps.executor.run(E.job, E.OI.plan.analyze(E.job), { dryrun, batchSize });
     if (!dryrun) E.last = { model: E.job.model, created: r.created, deps: r.deps };
     return r;
   },
@@ -246,6 +246,14 @@ PARTNERS_TSV = "\n".join("\t".join(r) for r in csv.reader(io.StringIO(PARTNERS))
 PARTNERS_UPDATE = """E-mail,Credit Limit,Customer Name
 ALPHA@oi.test,999,OI Test Alpha
 new@oi.test,5,OI Test New
+"""
+
+# Companies and their contacts in one file, the contacts listed before their company.
+PARTNERS_TREE = """Name,Related Company,E-mail
+OI Tree Kid,OI Tree Corp,kid@oi.test
+OI Tree Corp,,corp@oi.test
+OI Tree Branch,OI Tree Corp,branch@oi.test
+OI Tree Desk,oi tree branch,desk@oi.test
 """
 
 # Products and customers present in the demo data of Odoo 16 to 19.
@@ -381,6 +389,27 @@ def main():
             assert call("res.partner", "search_count", [["email", "=like", "%@oi.test"]], context={"active_test": False}) == 0
             assert call("res.partner.category", "search_count", [["name", "=", "Prospectz"]]) == 0
         check("undo deletes the created records and the created tag", undo)
+
+        def in_file_links():
+            s = ev(f"E.start('res.partner', {json.dumps(PARTNERS_TREE)})")
+            assert [m[0] for m in s["mapping"]] == ["name", "parent_id", "email"], s["mapping"]
+            assert s["conflicts"] == [], s["conflicts"]
+            assert s["stats"]["inFile"] == 3 and s["stats"]["create"] == 4, s["stats"]
+            r = ev("E.run(true)")
+            assert r["ok"] and not r["errors"], r
+            assert call("res.partner", "search_count", [["email", "=like", "%@oi.test"]]) == 0, "dry run must not write"
+            r = ev("E.run(false, 1)")  # one row per batch: links resolve across batches
+            assert r["ok"] and len(r["created"]) == 4, r
+            recs = call("res.partner", "search_read", [["email", "=like", "%@oi.test"]], ["name", "parent_id"])
+            parent = {x["name"]: x["parent_id"] and x["parent_id"][1] for x in recs}
+            assert parent["OI Tree Corp"] is False, parent
+            assert parent["OI Tree Kid"] == "OI Tree Corp" and parent["OI Tree Branch"] == "OI Tree Corp", parent
+            assert parent["OI Tree Desk"].endswith("OI Tree Branch"), parent
+            errors = ev("E.undo()")
+            assert not errors, errors
+            assert call("res.partner", "search_count", [["email", "=like", "%@oi.test"]], context={"active_test": False}) == 0
+            assert call("ir.model.data", "search_count", [["model", "=", "res.partner"], ["res_id", "in", r["created"]]]) == 0
+        check("contacts and their companies in one file: linked by external ids across batches, undo", in_file_links)
 
         def orders():
             s = ev(f"E.start('sale.order', {json.dumps(ORDERS)})")
@@ -692,10 +721,11 @@ def main():
             wait("U.qa('ol.columns li').length >= 3")
             cols = ev("U.qa('ol.columns .tech').map((x) => x.textContent)")
             assert "email" in cols and "id" not in cols, cols
-            # remove the first column, add Country › Country Code with the keyboard
-            first = cols[0]
-            ev("U.qa('ol.columns .remove')[0].click(); true")
-            assert first not in ev("U.qa('ol.columns .tech').map((x) => x.textContent)")
+            # untick the first column (it stays listed), add Country › Country Code with the keyboard
+            first = ev("U.q('ol.columns .label').textContent")
+            ev("U.qa('ol.columns input[type=checkbox]')[0].click(); true")
+            wait("U.qa('ol.columns li')[0].classList.contains('off')")
+            assert " of " in ev("U.text('.export')"), "ticked of listed count"
             ev("U.type('.adder input', 'Country'); true")
             wait("U.qa('.adder li').some((li) => li.textContent.startsWith('Country') && li.querySelector('.open'))")
             ev("""(() => { const a = U.q('.adder input'); const i = U.qa('.adder li').findIndex((li) => li.querySelector('.tech').textContent === 'country_id');
@@ -714,12 +744,13 @@ def main():
             rows = ev("""(async () => { const b = await OdooImport.sheet.readFile('x.xlsx', await __lastBlob.arrayBuffer()); return b.sheets[0].load(); })()""")
             headers = rows[0]
             assert "Email" in headers and "Country / Country Code" in headers, headers
+            assert first not in headers, (first, headers)
             assert len(rows) - 1 == n, (len(rows), n)
             bel = call("res.partner", "search_read", [["country_id.code", "=", "BE"]], ["email"], limit=1)
             if bel:
                 ci, ei = headers.index("Country / Country Code"), headers.index("Email")
                 assert any(r[ei] == bel[0]["email"] and r[ci] == "BE" for r in rows[1:] if bel[0]["email"]), "linked field exported"
-        check("export data: list-view columns, remove/add (Country › Code), xlsx", export_data)
+        check("export data: list-view columns, untick/add (Country › Code), xlsx", export_data)
 
         def export_reimport_round_trip():
             ev("U.button('Change').click(); true")

@@ -32,6 +32,7 @@
       decisions: new Map(), // conflict key -> {action, id?, value?, label?}
       defaults: new Map(), // field name -> {out, label}: constant for every record
       requiredMissing: [], // required fields without column nor Odoo default
+      inFile: new Map(), // col -> Map ref -> [rows]: rows of the file a self-referencing value can name
     };
   }
 
@@ -103,7 +104,41 @@
       });
       job.resolutions.set(col, res);
     }
+    job.inFile = [...job.rel.values()].some((r) => r.field.relation === job.model)
+      ? fileIndex(job, ["name", "complete_name", ...(await deps.schemas.keyFields(job.model))])
+      : new Map();
     await lookupExisting(job, deps);
+  }
+
+  // How a self-referencing value names a row: "__import__.x" and "x" are the same external id.
+  const refKey = (v, mode) => (mode === "xmlid" ? lower(v).replace(/^__import__\./, "") : lower(v));
+
+  /* Self-references: a relational column pointing at the imported model itself (a contact's
+   * parent company, a category's parent) may name a record that is a row of this same file.
+   * Indexes the record rows by the columns such a value can name them by: the External ID for
+   * external-id columns, else the name and the model's alternate keys (keyNames).
+   * Returns col -> Map refKey -> [record rows]. */
+  function fileIndex(job, keyNames) {
+    const out = new Map();
+    const top = active(job).filter((m) => !isSub(m));
+    const starts = recordRows(job);
+    for (const [col, r] of job.rel) {
+      if (r.field.relation !== job.model || r.mode === "dbid" || !top.some((m) => m.col === col)) continue;
+      const sources = top
+        .filter((m) => m.path.length === 1 && (r.mode === "xmlid" ? m.path[0] === "id" : keyNames.includes(m.path[0])))
+        .map((m) => m.col);
+      const index = new Map();
+      for (const i of starts) {
+        for (const c of sources) {
+          const k = refKey(job.table.rows[i][c], r.mode);
+          if (!k) continue;
+          if (!index.has(k)) index.set(k, []);
+          if (!index.get(k).includes(i)) index.get(k).push(i);
+        }
+      }
+      if (index.size) out.set(col, index);
+    }
+    return out;
   }
 
   async function lookupExisting(job, deps) {
@@ -142,8 +177,10 @@
     return m.fields.map((f) => f.string).join(" / ");
   }
 
-  /* Returns {conflicts, warnings, cell(col,row) -> {out}|null, rowId, skipRows, stats}.
-   * Conflicts block the import until decided; warnings don't. */
+  /* Returns {conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts}.
+   * Conflicts block the import until decided; warnings don't.
+   * inFile: `${col}:${row}:${lower(value)}` -> the row whose new record the value links to;
+   * levels: row -> import round (a record linking to a new record of the file goes after it). */
   function analyze(job) {
     const conflicts = [];
     const warnings = [];
@@ -204,6 +241,47 @@
 
     const starts = new Set(recordRows(job));
 
+    // A relational value that isn't a plain match: narrowed by the row, or a conflict.
+    const m2oIssue = (col, i, piece) => {
+      const rel = job.rel.get(col);
+      const r = (job.resolutions.get(col) || new Map()).get(piece);
+      const links = job.links.get(col) || [];
+      const header = job.table.headers[col];
+      const key = `m2o:${col}:${lower(piece)}`;
+      if (r.status === "ok") return;
+      if (r.status === "ambiguous" && links.length) {
+        // Narrow with the other columns of the same row (country of a state, company...).
+        let cands = r.candidates;
+        for (const l of links) {
+          const other = linkedId(job, l.col, i);
+          if (other) {
+            const narrowed = cands.filter((c) => c.links[l.field] === other);
+            if (narrowed.length) cands = narrowed;
+          }
+        }
+        if (cands.length === 1) {
+          rowId.set(`${col}:${i}:${lower(piece)}`, cands[0].id);
+          return;
+        }
+      }
+      if (decided(key)) return;
+      const rel2 = rel.field.relation;
+      const base = { key, kind: "m2o", status: r.status, col, value: piece, rows: [i], relation: rel2, field: rel.field, candidates: r.candidates };
+      if (r.status === "archived") {
+        push(warnings, { ...base, title: `“${piece}” is archived`, message: `${header}: the only match is an archived ${rel.field.string} record; it will be used.` });
+      } else if (r.status === "probable") {
+        push(conflicts, { ...base, title: `“${piece}” → ${r.candidates[0].label}?`, message: `${header}: no exact match in ${rel.field.string}; this one is close.` });
+      } else if (r.status === "ambiguous") {
+        push(conflicts, { ...base, title: `“${piece}” matches ${r.candidates.length} records`, message: `${header}: pick the right ${rel.field.string}.` });
+      } else {
+        push(conflicts, { ...base, title: `“${piece}” not found`, message: `${header}: no ${rel.field.string} with this name${r.candidates.length ? "; similar ones below" : ""}.` });
+      }
+    };
+    // Values naming another row of the file, settled once the skipped rows are known (7.).
+    const pending = [];
+    // Columns a stock count resolves itself (lot names, per product): no conflicts for them.
+    const own = NS.inventory ? NS.inventory.ownCols(job) : new Set();
+
     // 4. cell values
     for (const m of maps) {
       const col = m.col;
@@ -212,7 +290,7 @@
       const cache = new Map();
       conv.set(col, cache);
       const res = job.resolutions.get(col) || new Map();
-      const links = job.links.get(col) || [];
+      const index = job.inFile && job.inFile.get(col);
       const header = job.table.headers[col];
 
       for (let i = 0; i < rows.length; i++) {
@@ -232,38 +310,17 @@
           });
           continue;
         }
+        if (own.has(col)) continue;
         for (const piece of pieces(job, col, raw)) {
           const r = res.get(piece);
           if (!r) continue;
-          const key = `m2o:${col}:${lower(piece)}`;
-          if (r.status === "ok") continue;
-          if (r.status === "ambiguous" && links.length) {
-            // Narrow with the other columns of the same row (country of a state, company...).
-            let cands = r.candidates;
-            for (const l of links) {
-              const other = linkedId(job, l.col, i);
-              if (other) {
-                const narrowed = cands.filter((c) => c.links[l.field] === other);
-                if (narrowed.length) cands = narrowed;
-              }
-            }
-            if (cands.length === 1) {
-              rowId.set(`${col}:${i}:${lower(piece)}`, cands[0].id);
-              continue;
-            }
+          // A record of this file (not the row itself), unless the value was decided otherwise.
+          const targets = index ? (index.get(refKey(piece, rel.mode)) || []).filter((t) => t !== i) : [];
+          if (targets.length && !decided(`m2o:${col}:${lower(piece)}`)) {
+            pending.push({ col, i, piece, r, targets, header });
+            continue;
           }
-          if (decided(key)) continue;
-          const rel2 = rel.field.relation;
-          const base = { key, kind: "m2o", status: r.status, col, value: piece, rows: [i], relation: rel2, field: rel.field, candidates: r.candidates };
-          if (r.status === "archived") {
-            push(warnings, { ...base, title: `“${piece}” is archived`, message: `${header}: the only match is an archived ${rel.field.string} record; it will be used.` });
-          } else if (r.status === "probable") {
-            push(conflicts, { ...base, title: `“${piece}” → ${r.candidates[0].label}?`, message: `${header}: no exact match in ${rel.field.string}; this one is close.` });
-          } else if (r.status === "ambiguous") {
-            push(conflicts, { ...base, title: `“${piece}” matches ${r.candidates.length} records`, message: `${header}: pick the right ${rel.field.string}.` });
-          } else {
-            push(conflicts, { ...base, title: `“${piece}” not found`, message: `${header}: no ${rel.field.string} with this name${r.candidates.length ? "; similar ones below" : ""}.` });
-          }
+          m2oIssue(col, i, piece);
         }
       }
     }
@@ -336,6 +393,85 @@
       }
     }
 
+    // 7. values naming a row of this file: that row's record, existing or about to be created.
+    // New ones are linked in rounds: a record goes after the records of the file it links to.
+    const inFile = new Map();
+    const edges = new Map(); // row -> [{t, k, col, piece}]
+    for (const p of pending) {
+      const k = `${p.col}:${p.i}:${lower(p.piece)}`;
+      const cycleKey = `cycle:${p.col}:${p.i}`;
+      if (skipRows.has(p.i)) continue;
+      if (decided(cycleKey)) {
+        rowId.set(k, null); // left empty (a skipped row is in skipRows)
+        continue;
+      }
+      const live = p.targets.filter((t) => existingId(job, t) || (!skipRows.has(t) && existingTarget(job, t) !== "skip"));
+      if (!live.length) {
+        m2oIssue(p.col, p.i, p.piece); // its row isn't imported: look it up in Odoo as usual
+        continue;
+      }
+      const t = live[0];
+      const id = existingId(job, t);
+      const field = job.rel.get(p.col).field;
+      if (id) rowId.set(k, id);
+      else {
+        inFile.set(k, t);
+        if (!edges.has(p.i)) edges.set(p.i, []);
+        edges.get(p.i).push({ t, k, col: p.col, piece: p.piece, header: p.header, field });
+      }
+      if (live.length > 1) {
+        push(warnings, {
+          key: `infile:${p.col}:${lower(p.piece)}`, kind: "infile", col: p.col, value: p.piece, rows: [p.i], candidates: [],
+          title: `“${p.piece}” is the name of ${live.length} rows of this file`,
+          message: `${p.header}: linked to the first one (row ${job.table.lines[t]}).`,
+        });
+      } else if (!id && p.r.status === "ok") {
+        push(warnings, {
+          key: `infile:${p.col}:${lower(p.piece)}`, kind: "infile", col: p.col, value: p.piece, rows: [p.i], candidates: [],
+          title: `“${p.piece}” is also an existing ${field.string}`,
+          message: `${p.header}: linked to the record created from row ${job.table.lines[t]}, not to the existing one.`,
+        });
+      }
+    }
+    // Rounds by depth, walked without recursion (a long chain of rows must not overflow the stack).
+    // A link closing a circle can't be set: it becomes a conflict for its row.
+    const levels = new Map();
+    const state = new Map(); // row -> 1 on the current path, 2 done
+    for (const root of edges.keys()) {
+      if (state.has(root)) continue;
+      const stack = [[root, 0]];
+      state.set(root, 1);
+      while (stack.length) {
+        const top = stack[stack.length - 1];
+        const out = edges.get(top[0]) || [];
+        if (top[1] < out.length) {
+          const e = out[top[1]++];
+          const s = state.get(e.t);
+          if (s === 1) {
+            inFile.delete(e.k);
+            e.cycle = true;
+            const path = stack.slice(stack.findIndex((x) => x[0] === e.t)).map((x) => job.table.lines[x[0]]);
+            const line = job.table.lines[top[0]];
+            push(conflicts, {
+              key: `cycle:${e.col}:${top[0]}`, kind: "cycle", col: e.col, value: e.piece, rows: [top[0]], field: e.field, candidates: [],
+              title: `Row ${line}: “${e.piece}” leads back to this row`,
+              message: `${e.header}: rows ${[line, ...path].join(" → ")} point to each other in a circle. Leave this link empty or skip the row.`,
+            });
+          } else if (!s) {
+            state.set(e.t, 1);
+            stack.push([e.t, 0]);
+          }
+          continue;
+        }
+        stack.pop();
+        state.set(top[0], 2);
+        let level = 0;
+        for (const e of out) if (!e.cycle) level = Math.max(level, (levels.get(e.t) || 0) + 1);
+        if (level) levels.set(top[0], level);
+      }
+    }
+    stats.inFile = inFile.size;
+
     for (const i of starts) {
       if (skipRows.has(i)) {
         stats.skip++;
@@ -347,7 +483,7 @@
       else stats.create++;
     }
 
-    return { conflicts, warnings, conv, rowId, skipRows, stats, starts };
+    return { conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts };
   }
 
   // The id a relational column resolves to on a given row (for narrowing), if settled.
@@ -372,15 +508,22 @@
     if (!job.key || job.key.mode === "create") return null;
     const v = lower(job.table.rows[i][job.key.col]);
     if (!v) return null;
-    if (job.key.field === "id" || job.key.field === ".id") {
-      const found = job.existing.get(v) || [];
-      return found.length ? (job.key.mode === "skip" ? "skip" : found[0].id) : null;
-    }
-    const d = job.decisions.get(`existing:${v}`);
+    const d = job.key.field === "id" || job.key.field === ".id" ? null : job.decisions.get(`existing:${v}`);
     if (d) return d.action === "pick" ? d.id : d.action === "skip" ? "skip" : null;
+    const id = existingId(job, i);
+    return id && job.key.mode === "skip" ? "skip" : id;
+  }
+
+  // The existing record a record row stands for, updated or not (null: the row creates one).
+  function existingId(job, i) {
+    if (!job.key || job.key.mode === "create") return null;
+    const v = lower(job.table.rows[i][job.key.col]);
+    if (!v) return null;
     const found = job.existing.get(v) || [];
-    if (found.length !== 1) return null;
-    return job.key.mode === "skip" ? "skip" : found[0].id;
+    if (job.key.field === "id" || job.key.field === ".id") return found.length ? found[0].id : null;
+    const d = job.decisions.get(`existing:${v}`);
+    if (d) return d.action === "pick" ? d.id : null;
+    return found.length === 1 ? found[0].id : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -403,13 +546,27 @@
    * placeholder: Map relation -> id, used for still-to-create values during a dry run.
    * part: with record matching by a key, "update" (records found, with their ".id") or
    * "create" (the others, without the column: Odoo 16 refuses an empty ".id").
-   * Returns {fields, columns, rows, groups: [{src: [rowIdx], out: [start, end]}]}. */
-  function build(job, analysis, { created = new Map(), placeholder = new Map(), part = null } = {}) {
+   * level: only the records of this round (analysis.levels); null for all.
+   * rowIds: Map row -> id of the records of earlier rounds, for links to rows of the file (left
+   * empty until known: a dry run rolls every round back).
+   * linked: with xmlids, false for the records without links to rows of the file, true for the
+   * others, sorted so that a record comes after the records it links to.
+   * xmlids: Map row -> external id (see xmlids()): the rows other rows link to get it in the
+   * "id" column, and the links are sent as external ids, which Odoo resolves as it imports.
+   * Returns {fields, columns, rows, groups: [{src: [rowIdx], out: [start, end]}], mixed}; mixed:
+   * a link column of the linked records also names existing records (by database id), which
+   * can't go with external ids in one column. */
+  function build(job, analysis, { created = new Map(), placeholder = new Map(), part = null, level = null, rowIds = new Map(), linked = null, xmlids = null } = {}) {
     const maps = active(job);
     const rows = job.table.rows;
     const fields = [];
     const columns = [];
     const writers = []; // (rowIndex, isStart) -> string
+    const inFile = analysis.inFile || new Map();
+    const linkedRows = new Set([...inFile.keys()].map((k) => Number(k.split(":")[1])));
+    const xmlCols = linked && xmlids ? new Set([...inFile.keys()].map((k) => Number(k.split(":")[0]))) : new Set();
+    const withXmlid = !!(xmlids && part !== "update");
+    let mixed = false;
 
     for (const m of maps) {
       const col = m.col;
@@ -423,7 +580,7 @@
       if (rel) {
         const names = m.fields.map((f) => f.name);
         const relIdx = m.fields.indexOf(rel.field);
-        path = `${names.slice(0, relIdx + 1).join("/")}/.id`;
+        path = `${names.slice(0, relIdx + 1).join("/")}/${xmlCols.has(col) ? "id" : ".id"}`;
       } else {
         path = m.fields.map((f) => f.name).join("/");
       }
@@ -432,8 +589,10 @@
       const cache = analysis.conv.get(col);
       const res = job.resolutions.get(col) || new Map();
       const reqKey = `requiredempty:${col}`;
+      const ownXmlid = withXmlid && !isSub(m) && m.path.length === 1 && m.path[0] === "id";
       writers.push((i, isStart) => {
         const raw = String(rows[i][col] ?? "").trim();
+        if (!raw && ownXmlid && isStart && xmlids.has(i)) return xmlids.get(i);
         if (!raw) {
           const d = job.decisions.get(reqKey);
           if (isStart && d && d.action === "default") return d.out;
@@ -457,11 +616,14 @@
         for (const piece of pieces(job, col, raw)) {
           const k = lower(piece);
           const d = job.decisions.get(`m2o:${col}:${k}`);
-          // A row narrowed by its other columns wins over the decision taken for the value.
-          let id = analysis.rowId.get(`${col}:${i}:${k}`) || null;
-          if (id) {
-            // settled by the row context
-          } else if (d) {
+          const at = `${col}:${i}:${k}`;
+          // A record of this file, or a row narrowed by its other columns, wins over the
+          // decision taken for the value.
+          let id = null;
+          if (xmlCols.has(col) && inFile.has(at)) id = xmlids.get(inFile.get(at)) || null;
+          else if (inFile.has(at)) id = rowIds.get(inFile.get(at)) || null;
+          else if (analysis.rowId.has(at)) id = analysis.rowId.get(at);
+          else if (d) {
             if (d.action === "pick") id = d.id;
             else if (d.action === "create") {
               const ck = `${rel.field.relation}\u0000${lower(d.value)}`;
@@ -471,6 +633,7 @@
             const r = res.get(piece);
             if (r && (r.status === "ok" || r.status === "archived")) id = r.id;
           }
+          if (id && xmlCols.has(col) && !inFile.has(at)) mixed = true;
           if (id) ids.push(id);
         }
         if (!ids.length) {
@@ -497,18 +660,49 @@
       });
     }
 
+    // The external ids of the rows linked to, unless a mapped External ID column carries them.
+    const idColumn = withXmlid && !fields.includes("id");
+    if (idColumn) {
+      fields.push("id");
+      columns.push(false);
+      writers.push((i, isStart) => (isStart && xmlids.has(i) ? xmlids.get(i) : ""));
+    }
+
+    let list = groups(job);
+    if (linked !== null) list = list.filter((g) => linkedRows.has(g[0]) === linked);
+    if (linked) list.sort((a, b) => ((analysis.levels && analysis.levels.get(a[0])) || 0) - ((analysis.levels && analysis.levels.get(b[0])) || 0));
     const out = [];
     const outGroups = [];
-    for (const g of groups(job)) {
+    for (const g of list) {
       const start = g[0];
       const target = existingTarget(job, start);
       if (analysis.skipRows.has(start) || target === "skip") continue;
       if ((part === "update" && !target) || (part === "create" && target)) continue;
+      if (level !== null && ((analysis.levels && analysis.levels.get(start)) || 0) !== level) continue;
       const begin = out.length;
       for (const i of g) if (i === start || !analysis.skipRows.has(i)) out.push(writers.map((w) => w(i, i === start)));
       outGroups.push({ src: g, out: [begin, out.length] });
     }
-    return { fields, columns, rows: out, groups: outGroups };
+    // An "id" column nobody needs here: left out (an update must not get one).
+    if (idColumn && !out.some((r) => r[fields.length - 1])) {
+      fields.pop();
+      columns.pop();
+      for (const r of out) r.pop();
+    }
+    return { fields, columns, rows: out, groups: outGroups, mixed };
+  }
+
+  /* External ids for the rows other rows of the file link to, for a batch-wise import: the
+   * row's own External ID when it has one, else one made of stamp (unique per import) and the
+   * row's line. Odoo resolves a link to a record of an earlier row of the same batch too. */
+  function xmlids(job, analysis, stamp) {
+    const idCol = active(job).find((m) => !isSub(m) && m.path.length === 1 && m.path[0] === "id");
+    const out = new Map();
+    for (const t of new Set((analysis.inFile || new Map()).values())) {
+      const own = idCol ? String(job.table.rows[t][idCol.col] ?? "").trim() : "";
+      out.set(t, own ? (own.includes(".") ? own : `__import__.${own}`) : `__import__.oi_${stamp}_${job.table.lines[t]}`);
+    }
+    return out;
   }
 
   // Rows are matched to existing records by a key other than the External / Database ID.
@@ -516,5 +710,5 @@
     return !!(job.key && job.key.mode === "update" && job.key.field !== "id" && job.key.field !== ".id");
   }
 
-  NS.plan = { needsDbId, newJob, active, relationOf, pieces, resolveAll, lookupExisting, recordRows, groups, analyze, build, toCreate, existingTarget, isSub };
+  NS.plan = { needsDbId, newJob, active, relationOf, pieces, resolveAll, fileIndex, lookupExisting, recordRows, groups, analyze, build, xmlids, toCreate, existingTarget, existingId, isSub };
 })();

@@ -242,7 +242,8 @@ ol.columns .grip { color: var(--fg-3); font: 11px var(--mono); min-width: 22px; 
 ol.columns .label { font-weight: 600; }
 ol.columns .tech { color: var(--fg-3); font: 11px var(--mono); margin-left: auto; margin-right: 6px; }
 ol.columns .icon-btn:disabled { opacity: .3; cursor: default; }
-ol.columns .remove { color: var(--danger); font-size: 16px; }
+ol.columns input[type=checkbox] { margin: 0; cursor: pointer; }
+ol.columns li.off .label, ol.columns li.off .grip { color: var(--fg-3); font-weight: 400; }
 .adder { max-width: 460px; }
 .adder input { width: 100%; }
 .adder .crumb { font-size: 12px; color: var(--fg-2); padding: 2px 0 6px; display: flex; gap: 6px; align-items: center; }
@@ -339,4 +340,17 @@ table.grid.numbers td.n, table.grid.numbers th.n { text-align: right; font-varia
 .toast.show { opacity: .92; }
 .empty-state { text-align: center; color: var(--fg-2); padding: 40px 0; }
 .kbd-help { color: var(--fg-3); font-size: 11px; margin-left: auto; }
+.count-modes { display: flex; flex-direction: column; gap: 8px; margin: 0 0 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-2); }
+.count-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; }
+.count-mode { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; background: var(--bg); }
+.count-mode.on { border-color: var(--accent-2); background: var(--accent-soft); }
+.count-mode input { margin-top: 3px; }
+.count-mode small { display: block; color: var(--fg-2); font-size: 11.5px; line-height: 1.35; margin-top: 2px; }
+.count-table td.num, .count-table th:nth-child(n+5):nth-child(-n+7) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.count-table td.up { color: var(--ok); }
+.count-table td.down { color: var(--danger); }
+.count-table tr.muted td { color: var(--fg-3); }
+.count-table .tag { margin-left: 6px; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.count-warnings { margin-bottom: 10px; }
+.apply-form { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--bg); color: var(--fg); display: flex; flex-direction: column; gap: 8px; }
 `;

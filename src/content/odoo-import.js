@@ -71,6 +71,8 @@
     reviewTab: "conflicts",
     result: null, // last run result
     check: null, // last dry run result
+    count: null, // stock count planned against the stock in Odoo (inventory.prepare)
+    countErr: null, // why reading the stock failed (not retried by itself)
     progress: null,
     op: null, // the long operation in progress: {kind, ctrl}
     history: [],
@@ -228,7 +230,7 @@
     if (!op) return;
     op.ctrl.abort();
     // The real import stops after the batch being saved, so its ids are kept for undo.
-    if (op.kind === "import") return renderFooter();
+    if (op.kind === "import" || op.kind === "apply") return renderFooter();
     endTask();
     S.progress = null;
     // A lookup stopped half-way leaves partial matches: they must be looked up again.
@@ -245,7 +247,7 @@
   function startOver() {
     if (S.mode === "import") return discard();
     if (S.op) {
-      if (S.op.kind === "import") return;
+      if (S.op.kind === "import" || S.op.kind === "apply") return;
       S.op.ctrl.abort();
       endTask();
       S.busy = "";
@@ -267,13 +269,13 @@
 
   // Throw the current file, mapping and decisions away and start again (the model stays).
   function discard() {
-    if (S.op && S.op.kind === "import") return;
+    if (S.op && (S.op.kind === "import" || S.op.kind === "apply")) return;
     const finished = !!S.result;
     if (S.op) {
       S.op.ctrl.abort();
       endTask();
     }
-    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map(), sample: null });
+    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, count: null, countErr: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map(), sample: null });
     S.step = "source";
     toast(finished ? "Ready for a new import" : "Discarded");
     render();
@@ -334,9 +336,9 @@
     }
   }
 
-  // What the Odoo page shows (page bridge in the page's own JS world); null without the bridge.
+  // Ask the page bridge (in the page's own JS world); null without the bridge.
   let bridgeSeq = 0;
-  function pageContext() {
+  function bridge(cmd, args = {}) {
     return new Promise((resolve) => {
       const id = ++bridgeSeq;
       const done = (value) => {
@@ -355,9 +357,12 @@
       };
       const timer = setTimeout(() => done(null), 400); // no bridge (or no Odoo web client)
       document.addEventListener("odoo-import-export:res", onRes);
-      document.dispatchEvent(new CustomEvent("odoo-import-export:req", { detail: JSON.stringify({ id, cmd: "context" }) }));
+      document.dispatchEvent(new CustomEvent("odoo-import-export:req", { detail: JSON.stringify({ ...args, id, cmd }) }));
     });
   }
+
+  // What the Odoo page shows: {model, domain, selectedIds, ...}.
+  const pageContext = () => bridge("context");
 
   // Read the page again; start Export/Analyze from what it shows (ticked records, else its search).
   // Returns whether anything changed.
@@ -392,25 +397,50 @@
           id = rows.length ? rows[0].res_id : null;
         }
         if (!id) return null;
-        const act = await S.client.call("ir.actions.act_window", "search_read", [[["id", "=", id]], ["res_model"]]);
-        return act.length ? act[0].res_model : null;
+        return actionModel([["id", "=", id]]);
       }
       if (p.startsWith("m-")) return p.slice(2);
       if (p.includes(".")) return p;
-      const act = await S.client.call("ir.actions.act_window", "search_read", [[["path", "=", p]], ["res_model"]], { limit: 1 }).catch(() => []);
-      if (act.length) return act[0].res_model;
+      const model = await actionModel([["path", "=", p]]);
+      if (model) return model;
     }
     return null;
+  }
+
+  // The model of a window action, or of a server action (Physical Inventory is one).
+  async function actionModel(domain) {
+    const act = await S.client.call("ir.actions.act_window", "search_read", [domain, ["res_model"]], { limit: 1 }).catch(() => []);
+    if (act.length) return act[0].res_model;
+    const server = await S.client.call("ir.actions.server", "search_read", [domain, ["model_name"]], { limit: 1 }).catch(() => []);
+    return server.length ? server[0].model_name || null : null;
+  }
+
+  /* The model's name. Reading ir.model takes rights many users lack (an Inventory User may
+   * not): then the model is checked by reading its fields, which only takes rights on the
+   * model itself, and its technical name stands for its name. */
+  async function modelLabel(model) {
+    let rows = null;
+    try {
+      rows = await S.client.call("ir.model", "search_read", [[["model", "=", model]], ["model", "name"]]);
+    } catch (e) {
+      if (!/access|not allowed/i.test(`${e.title} ${e.message}`)) throw e;
+    }
+    if (rows) {
+      if (!rows.length) throw new Error(`Unknown model ${model}`);
+      return rows[0].name;
+    }
+    await S.deps.schemas.load(model);
+    if (S.models && !S.models.some((m) => m.model === model)) S.models = [...S.models, { model, name: model }];
+    return model;
   }
 
   async function setModel(model) {
     if (!model) return;
     try {
-      const rows = await S.client.call("ir.model", "search_read", [[["model", "=", model]], ["model", "name"]]);
-      if (!rows.length) throw new Error(`Unknown model ${model}`);
+      const name = await modelLabel(model);
       if (S.model !== model) S.filters = [];
       S.model = model;
-      S.modelName = rows[0].name;
+      S.modelName = name;
       if (S.mode === "export") prepareExport();
       if (S.mode === "analyze") prepareAnalyze();
       S.job = null;
@@ -577,6 +607,7 @@
         } });
       wrap.append(paste);
       if (S.model && S.session) wrap.append(templateRow());
+      if (S.model === OI.inventory.MODEL && S.session && counts()) wrap.append(countSheetRow());
       if (S.session) wrap.append(sampleCard());
       return wrap;
     }
@@ -701,6 +732,29 @@
       ...odooTemplates.get(model).map((t) => h("a", { class: "btn small ghost", href: t.url, download: "" }, t.label)));
   }
 
+  // A count sheet: the stock of a location, with an empty Counted Quantity column to fill in.
+  function countSheetRow() {
+    return h("div", { class: "row template-row" },
+      h("span", { class: "muted small" }, "Counting a location? Start from its stock:"),
+      searchInline("stock.location", (id, label) => downloadCountSheet(id, label), "Location to count…", [["usage", "in", ["internal", "transit"]]]),
+      h("label", { class: "row small muted" }, h("input", { type: "checkbox", checked: !!S.countSheetSub, onchange: (e) => { S.countSheetSub = e.target.checked; } }), "with sublocations"));
+  }
+
+  function downloadCountSheet(id, label) {
+    return task("template", "Building the count sheet…", async (op) => {
+      const t = await OI.inventory.countSheet(op.client, { locations: [id], sublocations: !!S.countSheetSub, label });
+      if (!alive(op)) return;
+      const blob = await OI.xlsxwriter.book({ sheets: t.sheets });
+      if (!alive(op)) return;
+      const url = URL.createObjectURL(blob);
+      download(url, t.fileName);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      endTask();
+      setBusy("");
+      toast(t.rows ? `Count sheet with ${t.rows} stock lines downloaded` : "Count sheet downloaded (nothing in stock there yet)");
+    });
+  }
+
   function downloadTemplate() {
     return task("template", "Building the template…", async (op) => {
       const t = await OI.template.build(op.client, S.deps.schemas, S.model, S.modelName);
@@ -763,8 +817,11 @@
       await OI.pipeline.updateRequired(op.deps, job);
       await OI.pipeline.resolve(op.deps, job);
       if (!alive(op)) return;
+      if (counts() && OI.inventory.ensure(job)) OI.inventory.setMode(job, job.count.mode);
       S.analysis = OI.plan.analyze(job);
       S.check = null;
+      S.count = null;
+      S.countErr = null;
       S.reviewTab = "conflicts";
       S.expanded = new Set();
       S.groupLimit = new Map();
@@ -917,6 +974,8 @@
   function reanalyze() {
     S.analysis = OI.plan.analyze(S.job);
     S.check = null;
+    S.count = null;
+    S.countErr = null;
     render();
   }
 
@@ -953,7 +1012,7 @@
     return `${lines.length > 1 ? "rows" : "row"} ${shown}${lines.length > 4 ? ` +${lines.length - 4}` : ""}`;
   }
 
-  const KIND_LABEL = { column: "column", dateorder: "date format", m2o: "", value: "value", requiredempty: "required", existing: "existing", duplicate: "duplicate", requiredcol: "required", archived: "archived" };
+  const KIND_LABEL = { column: "column", dateorder: "date format", m2o: "", value: "value", requiredempty: "required", existing: "existing", duplicate: "duplicate", requiredcol: "required", archived: "archived", cycle: "circular", infile: "in this file" };
 
   function card(c, index, isWarning) {
     const kind = c.kind === "m2o" ? c.status : c.kind;
@@ -1017,6 +1076,8 @@
         h("button", { type: "button", class: "btn small", onclick: () => decide(c, { action: "all" }) }, "Import all"),
         h("button", { type: "button", class: "btn small", onclick: () => decide(c, { action: "first" }) }, "Keep the first row"),
         h("button", { type: "button", class: "btn small", onclick: () => decide(c, { action: "last" }) }, "Keep the last row"));
+    } else if (c.kind === "cycle") {
+      actions.append(emptyBtn(c, c.field), skipBtn(c));
     } else if (c.kind === "requiredcol") {
       actions.append(valueSetter(c.field, (out, label) => {
         S.job.defaults.set(c.field.name, { out, label, path: c.field.type === "many2one" ? `${c.field.name}/.id` : c.field.name });
@@ -1045,7 +1106,7 @@
   }
 
   // Search any record of a model (name_search) and pick one.
-  function searchInline(relation, onpick, placeholder = "Search…") {
+  function searchInline(relation, onpick, placeholder = "Search…", domain = []) {
     const wrap = h("span", { class: "search-inline" });
     const input = h("input", { type: "search", placeholder, "aria-label": "Search records" });
     const list = h("ul", { class: "dropdown", hidden: true });
@@ -1059,7 +1120,7 @@
     input.addEventListener("input", () => {
       clearTimeout(timer);
       timer = setTimeout(async () => {
-        items = await S.client.call(relation, "name_search", [input.value, [], "ilike", 12]).catch(() => []);
+        items = await S.client.call(relation, "name_search", [input.value, domain, "ilike", 12]).catch(() => []);
         sel = 0;
         draw();
       }, 200);
@@ -1165,6 +1226,10 @@
       pick: `→ ${d.label || `#${d.id}`}`, create: `→ create “${d.value}”`, empty: "→ left empty", skip: `→ ${d.rows ? d.rows.length : ""} row(s) skipped`,
       value: `→ “${d.value}”`, default: `→ ${d.label}`, first: "→ first row kept", last: "→ last row kept", all: "→ all rows kept",
     }[d.action] || d.action;
+    if (kind === "cycle") {
+      const [, c, row] = key.split(":");
+      return `${S.job.table.headers[Number(c)]}, row ${S.job.table.lines[Number(row)]}: circular link ${act}`;
+    }
     const col = /^[a-z0-9]+:(\d+):/.exec(key);
     const where = col ? `${S.job.table.headers[Number(col[1])]}: ` : kind === "duplicate" ? "Duplicate: " : kind === "existing" ? "Existing: " : "";
     return `${where}“${what}” ${act}`;
@@ -1175,14 +1240,18 @@
     const job = S.job;
     const wrap = h("div");
     const probable = a.conflicts.filter((c) => c.status === "probable");
+    const counting = OI.inventory.active(job);
     wrap.append(h("div", { class: "summary" },
-      h("div", { class: "stat good" }, h("b", null, a.stats.create), "to create"),
-      h("div", { class: "stat good" }, h("b", null, a.stats.update), "to update"),
+      counting
+        ? h("div", { class: "stat good" }, h("b", null, a.stats.records - a.stats.skip), "rows to count")
+        : [h("div", { class: "stat good" }, h("b", null, a.stats.create), "to create"), h("div", { class: "stat good" }, h("b", null, a.stats.update), "to update")],
       a.stats.skip ? h("div", { class: "stat" }, h("b", null, a.stats.skip), "skipped") : null,
+      a.stats.inFile ? h("div", { class: "stat good", title: "Values naming another new record of this file: that record is imported first, then linked. Check with Odoo leaves these links empty (each check is rolled back)." }, h("b", null, a.stats.inFile), "linked within the file") : null,
       h("div", { class: `stat ${a.conflicts.length ? "bad" : "good"}` }, h("b", null, a.conflicts.length), a.conflicts.length === 1 ? "conflict" : "conflicts"),
       a.warnings.length ? h("div", { class: "stat warn" }, h("b", null, a.warnings.length), "warnings") : null,
       h("span", { class: "spacer" }),
-      keyControl()));
+      counting ? null : keyControl()));
+    if (job.model === OI.inventory.MODEL && counts()) wrap.append(countModes());
 
     const tabs = h("div", { class: "tabs", role: "tablist" },
       [["conflicts", `To decide (${a.conflicts.length})`], ["warnings", `Warnings (${a.warnings.length})`], ["preview", "Preview data"]].map(([k, l]) =>
@@ -1303,6 +1372,81 @@
     return h("span", { class: "row small" }, "Find existing records by", sel, "· if found:", mode);
   }
 
+  // Stock counts (count modes, count sheet) on the Odoo releases they're tested on only.
+  const counts = () => OI.inventory.tested(S.version);
+
+  // Stock counts (stock.quant): how the sheet updates the stock, and what the count still needs.
+  function countModes() {
+    const job = S.job;
+    const inv = OI.inventory;
+    const c = inv.ensure(job);
+    const box = h("div", { class: "count-modes" },
+      h("div", { class: "count-title" }, h("b", null, "Stock count"), h("span", { class: "muted small" }, " · how should this sheet update the stock?")),
+      h("div", { class: "count-grid", role: "radiogroup", "aria-label": "How to import" }, inv.MODES.map((m) => h("label", { class: `count-mode${c.mode === m.id ? " on" : ""}` },
+        h("input", { type: "radio", name: "count-mode", value: m.id, checked: c.mode === m.id, onchange: () => setCountMode(m.id) }),
+        h("span", null, h("b", null, m.label), h("small", null, m.text))))));
+    if (c.mode === "overwrite") {
+      box.append(h("label", { class: "row small" }, h("input", { type: "checkbox", checked: !!c.sublocations, onchange: (e) => { c.sublocations = e.target.checked; S.count = null; render(); } }),
+        h("span", null, "Include sublocations: a count of WH/Stock also counts 0 what is in WH/Stock/Shelf 1 and below, unless the sheet lists it.")));
+    }
+    if (!inv.active(job)) return box;
+    if (c.sole === undefined) findSoleLocation(job);
+    const d = job.defaults.get("location_id");
+    const pick = (placeholder) => searchInline("stock.location", (id, label) => { job.defaults.set("location_id", { out: String(id), label, path: "location_id/.id" }); reanalyze(); },
+      placeholder, [["usage", "in", ["internal", "transit"]]]);
+    const why = d && d.auto ? h("span", { class: "muted" }, ` (${d.why}, filled in for you)`) : null;
+    if (inv.columns(job).location === null) {
+      box.append(h("div", { class: "row small" }, h("span", null, "The sheet has no Location column. Location for every row:"), d ? h("b", null, d.label) : null, why,
+        pick(d ? "Change…" : "Search a location…")));
+    } else if (d && d.auto) {
+      box.append(h("div", { class: "row small" }, h("span", null, "Rows without a location are counted in"), h("b", null, d.label), why, pick("Change…")));
+    }
+    const problems = inv.problems(job);
+    if (problems.length) box.append(h("div", { class: "notice warn" }, h("span", null, "⚠"), h("div", { class: "grow" }, problems.map((p) => h("div", null, p)))));
+    box.append(h("div", { class: "muted small" }, "The import sets the counted quantities; the stock changes once they are applied (validated). After the import, review them in Odoo or apply them from here."));
+    return box;
+  }
+
+  // One location for the whole count when the database (or the user) has only one: filled in, shown.
+  function findSoleLocation(job) {
+    job.count.sole = null; // looked up once per file
+    OI.inventory.soleLocation(S.client, S.session && S.session.uid).then((sole) => {
+      if (!sole || S.job !== job) return;
+      job.count.sole = sole;
+      if (!OI.inventory.active(job) || job.defaults.has("location_id")) return;
+      job.defaults.set("location_id", OI.inventory.soleDefault(sole));
+      reanalyze();
+    }).catch(() => null);
+  }
+
+  function setCountMode(mode) {
+    const back = OI.inventory.setMode(S.job, mode);
+    S.count = null;
+    S.countErr = null;
+    S.check = null;
+    if (back) return lookupKey(S.job); // Odoo's default flow: the key's records again
+    reanalyze();
+  }
+
+  // Read the stock the count touches and plan it (the Import step shows it before anything runs).
+  function loadCount() {
+    const job = S.job;
+    S.countErr = null;
+    return task("count", "Reading the stock in Odoo…", async (op) => {
+      try {
+        const plan = await OI.inventory.prepare(op.deps, job, S.analysis);
+        if (!alive(op)) return;
+        S.count = plan;
+      } catch (e) {
+        if (!(e && e.aborted)) S.countErr = e && e.message ? e.message : String(e);
+        throw e;
+      }
+      endTask();
+      setBusy("");
+      render();
+    });
+  }
+
   // The source rows, each cell tinted by what will happen to it.
   function gridPreview() {
     const job = S.job;
@@ -1329,9 +1473,14 @@
           for (const p of parts) {
             const key = `m2o:${col}:${lower(p)}`;
             const d = job.decisions.get(key);
-            const narrowed = a.rowId.get(`${col}:${i}:${lower(p)}`);
+            const at = `${col}:${i}:${lower(p)}`;
+            const narrowed = a.rowId.get(at);
             const r = (job.resolutions.get(col) || new Map()).get(p);
-            if (narrowed) labels.push(`#${narrowed}`);
+            if (a.inFile.has(at)) labels.push(`the record of row ${job.table.lines[a.inFile.get(at)]}`);
+            else if (a.rowId.has(at) && !narrowed) {
+              if (cls === "c-ok") cls = "c-fix";
+              labels.push("left empty");
+            } else if (narrowed) labels.push(`#${narrowed}`);
             else if (d) {
               if (cls === "c-ok") cls = "c-fix";
               labels.push(describeDecision(key, d).split("” ").pop());
@@ -1376,7 +1525,7 @@
       const btn = cardEl.querySelectorAll(".cand")[Number(key) - 1];
       if (btn) btn.click();
     } else if (key === "c" && c.kind === "m2o" && c.status !== "archived" && !createReason(c)) decide(c, { action: "create", value: c.value });
-    else if (key === "e" && (c.kind === "m2o" || c.kind === "value")) decide(c, { action: "empty" });
+    else if (key === "e" && (c.kind === "m2o" || c.kind === "value" || c.kind === "cycle")) decide(c, { action: "empty" });
     else if (key === "s" && c.rows.length) decide(c, { action: "skip" });
     else return;
     e.preventDefault();
@@ -1400,6 +1549,9 @@
       go("review");
       return toast("Settle the conflicts first");
     }
+    const counting = OI.inventory.active(job);
+    if (counting && !S.count) return loadCount();
+    if (counting && S.count.errors.length) return toast("Leave out the rows that can't be counted first");
     let result = null;
     let cancelled = false;
     // The check can be cut off at any time (Odoo rolls it back anyway); the real import
@@ -1411,7 +1563,7 @@
       if (dryrun) S.check = null;
       render();
       try {
-        result = await op.deps.executor.run(job, S.analysis, {
+        const opts = {
           dryrun,
           batchSize: Math.max(1, Number(S.settings.batchSize) || 500),
           signal: op.ctrl.signal,
@@ -1421,7 +1573,10 @@
             S.progress = { ...p, started: S.progress.started };
             renderProgress();
           },
-        });
+        };
+        result = counting
+          ? await OI.inventory.run(op.client, op.deps.executor, S.count, { ...opts, uid: S.session.uid })
+          : await op.deps.executor.run(job, S.analysis, opts);
       } catch (e) {
         if (e && e.aborted) cancelled = true;
         else result = { ok: false, dryrun, errors: [{ row: null, line: null, message: e.message, title: e.title }], created: [], updated: [], deps: [], warnings: [] };
@@ -1435,7 +1590,7 @@
     if (dryrun) S.check = result;
     else {
       S.result = result;
-      if (result.created.length || result.updated.length || (result.deps || []).length) {
+      if (result.created.length || result.updated.length || (result.deps || []).length || (result.count && result.count.created.length)) {
         await addHistory(job, result);
         if (result.ok) await remember(job, result);
       }
@@ -1456,6 +1611,7 @@
     const t = body.querySelector(".progress-text");
     if (t && p) {
       if (p.phase === "create") t.textContent = `Creating linked records… ${p.done}/${p.total}`;
+      else if (p.phase === "apply") t.textContent = `Applying counts… ${p.done} / ${p.total}`;
       else {
         // Rows per second so far, and what is left at that pace.
         const secs = (performance.now() - p.started) / 1000;
@@ -1472,6 +1628,7 @@
     }
     S.analysis = OI.plan.analyze(S.job);
     S.check = null;
+    S.count = null;
     render();
   }
 
@@ -1502,6 +1659,7 @@
   }
 
   function renderImport() {
+    if (OI.inventory.active(S.job)) return renderCount();
     const a = S.analysis;
     const job = S.job;
     const wrap = h("div");
@@ -1510,6 +1668,7 @@
       h("div", { class: "stat good" }, h("b", null, a.stats.create), "to create"),
       h("div", { class: "stat good" }, h("b", null, a.stats.update), "to update"),
       a.stats.skip ? h("div", { class: "stat" }, h("b", null, a.stats.skip), "skipped") : null,
+      a.stats.inFile ? h("div", { class: "stat good", title: "Values naming another new record of this file: that record is imported first, then linked. Check with Odoo leaves these links empty (each check is rolled back)." }, h("b", null, a.stats.inFile), "linked within the file") : null,
       willCreate.length ? h("div", { class: "stat" }, h("b", null, willCreate.length), `linked record${willCreate.length === 1 ? "" : "s"} to create first`) : null,
       h("span", { class: "spacer" }),
       h("label", { class: "row small muted" }, "Rows per batch", h("input", { type: "number", min: "1", max: "5000", value: S.settings.batchSize, style: "width:80px",
@@ -1578,6 +1737,211 @@
     return wrap;
   }
 
+  // The Import step of a stock count: what the sheet does to the stock, then check and set.
+  function renderCount() {
+    const job = S.job;
+    const p = S.count;
+    const wrap = h("div");
+    if (!p) {
+      if (S.countErr) {
+        wrap.append(h("div", { class: "notice err" }, h("span", null, "✕"), h("div", { class: "grow" }, h("b", null, "Couldn't read the stock. "), S.countErr)),
+          h("button", { type: "button", class: "btn", onclick: () => loadCount() }, "Try again"));
+      } else {
+        wrap.append(h("div", { class: "row small muted" }, h("span", { class: "spinner" }), "Reading the stock in Odoo…"));
+        if (!S.op) setTimeout(() => { if (!S.op && !S.count && !S.countErr && S.step === "import") loadCount(); });
+      }
+      return wrap;
+    }
+    const st = p.stats;
+    const fmt = (n) => (n > 0 ? `+${n.toLocaleString()}` : n.toLocaleString());
+    const mode = OI.inventory.MODES.find((m) => m.id === p.mode);
+    wrap.append(h("div", { class: "summary" },
+      h("div", { class: "stat good" }, h("b", null, st.update), "stock lines updated"),
+      st.create ? h("div", { class: "stat good" }, h("b", null, st.create), "new stock lines") : null,
+      st.zero ? h("div", { class: "stat warn" }, h("b", null, st.zero), "counted 0") : null,
+      h("div", { class: "stat", title: "Units, all products together: counted minus on hand" }, h("b", null, fmt(st.net)), "units difference"),
+      st.newLots ? h("div", { class: "stat" }, h("b", null, st.newLots), `new lot${st.newLots === 1 ? "" : "s"}`) : null,
+      p.errors.length ? h("div", { class: "stat bad" }, h("b", null, p.errors.length), "can't be counted") : null,
+      h("span", { class: "spacer" }),
+      h("label", { class: "row small muted" }, "Rows per batch", h("input", { type: "number", min: "1", max: "5000", value: S.settings.batchSize, style: "width:80px",
+        onchange: (e) => { S.settings.batchSize = Number(e.target.value) || 500; store.set(K.settings, S.settings); } }))));
+    wrap.append(h("div", { class: "muted small", style: "margin-bottom:8px" }, h("b", null, mode.label), ` · ${mode.text}`,
+      p.mode === "overwrite" ? ` Locations: ${p.locations.join(", ")}${p.sublocations ? " and their sublocations" : ""}.` : ""));
+
+    if (S.progress) {
+      wrap.append(h("div", { class: "progress" }, h("div")), h("div", { class: "row small muted" }, h("span", { class: "spinner" }), h("span", { class: "progress-text" }, "")));
+      setTimeout(renderProgress);
+      return wrap;
+    }
+
+    const r = S.result;
+    if (r) {
+      const c = r.count || { prev: [], created: [], zeroed: 0 };
+      const n = c.prev.length + c.created.length;
+      if (r.ok) wrap.append(countDone(r, p, n, c));
+      else {
+        wrap.append(h("div", { class: "notice err" }, h("span", null, "✕"), h("div", { class: "grow" },
+          h("b", null, r.cancelled ? "Stopped." : "The import stopped on an error."),
+          n ? h("div", null, `Counts were set on ${n} stock lines of earlier batches. You can undo them from History.`) : h("div", null, "Nothing was saved."))));
+        wrap.append(errorList(r.errors));
+      }
+      if (r.warnings && r.warnings.length) wrap.append(h("details", null, h("summary", { class: "muted small" }, `${r.warnings.length} messages from Odoo`), errorList(r.warnings)));
+      return wrap;
+    }
+
+    if (p.errors.length) {
+      const rows = [...new Set(p.errors.map((e) => e.row))];
+      wrap.append(h("div", { class: "notice err" }, h("span", null, "✕"), h("div", { class: "grow" },
+        h("b", null, `${rows.length} row${rows.length > 1 ? "s" : ""} can't be counted.`), h("div", null, "Fix the file, or leave them out: their stock isn't touched."))));
+      wrap.append(errorList(p.errors), h("div", { class: "row", style: "margin-bottom:10px" },
+        h("button", { type: "button", class: "btn", onclick: () => skipErrorRows(p) }, `Leave these ${rows.length} rows out`),
+        h("button", { type: "button", class: "btn", onclick: () => downloadErrors(p) }, "Download them as CSV")));
+    }
+    if (p.warnings.length) {
+      wrap.append(h("details", { class: "count-warnings", open: p.warnings.length <= 5 }, h("summary", null, `${p.warnings.length} thing${p.warnings.length > 1 ? "s" : ""} to know`),
+        h("ul", { class: "errors" }, p.warnings.slice(0, 100).map((w) => h("li", null, h("div", { class: "grow" },
+          h("div", null, h("b", null, w.title), w.lines.length ? h("span", { class: "ln" }, ` · line${w.lines.length > 1 ? "s" : ""} ${w.lines.slice(0, 6).join(", ")}${w.lines.length > 6 ? ` +${w.lines.length - 6}` : ""}`) : null),
+          h("div", { class: "hint" }, w.message)))))));
+    }
+    wrap.append(countTable(p));
+
+    const c = S.check;
+    const total = st.total;
+    if (!total) {
+      wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" }, "Nothing to count.")));
+    } else if (!c) {
+      wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" },
+        h("b", null, "Check first (recommended). "), "Odoo sets every count and rolls it back, reporting what it would refuse. Nothing is saved.")));
+      wrap.append(h("div", { class: "row" }, h("button", { type: "button", class: "btn", disabled: !!p.errors.length, onclick: () => runImport(true) }, "Check with Odoo")));
+    } else if (c.noDryRun) {
+      wrap.append(h("div", { class: "notice warn" }, h("span", null, "⚠"), h("div", { class: "grow" }, "This database has no import module (base_import), so a check isn't possible.")));
+    } else if (c.ok) {
+      wrap.append(h("div", { class: "notice ok" }, h("span", { class: "big-ok" }, "✓"), h("div", { class: "grow" }, h("b", null, "Odoo accepts every count."), h("div", null, `Ready to set ${total} count${total === 1 ? "" : "s"}. Applying them (the stock moves) is the next step, after the import.`))));
+    } else {
+      wrap.append(h("div", { class: "notice err" }, h("span", null, "✕"), h("div", { class: "grow" }, h("b", null, "Odoo would refuse some counts."))), errorList(c.errors),
+        h("div", { class: "row" }, h("button", { type: "button", class: "btn ghost", onclick: () => runImport(true) }, "Check again")));
+    }
+    return wrap;
+  }
+
+  /* After the counts are set: the stock hasn't changed yet. Two ways on, both a click away:
+   * review the differences in Odoo and apply there, or apply them here (with a confirmation). */
+  function countDone(r, p, n, c) {
+    const entry = r.entry;
+    const a = r.apply; // what "Apply now" did
+    const set = `Counts set on ${n} stock line${n === 1 ? "" : "s"}${c.created.length ? ` (${c.created.length} new)` : ""}${c.zeroed ? `, ${c.zeroed} counted 0` : ""}.`;
+    const another = h("button", { type: "button", class: "btn small", onclick: () => discard() }, "Import another file");
+    if (a) {
+      const left = a.outdated.length;
+      const box = h("div", null);
+      if (a.applied.length) {
+        box.append(h("div", { class: "notice ok" }, h("span", { class: "big-ok" }, "✓"), h("div", { class: "grow" },
+          h("b", null, `Applied ${a.applied.length} count${a.applied.length === 1 ? "" : "s"}: the stock is updated.`),
+          h("div", null, `Stock moves made${a.reason ? `, reference “${a.reason}”` : ""}. To correct them, count again.`))));
+      }
+      if (left || a.errors.length) {
+        box.append(h("div", { class: `notice ${a.errors.length ? "err" : "warn"}` }, h("span", null, a.errors.length ? "✕" : "⚠"), h("div", { class: "grow" },
+          left ? h("div", null, h("b", null, `${left} line${left === 1 ? "" : "s"} not applied: the stock moved in Odoo since the count.`), " Review them in Odoo, which asks whether to keep the count or the new stock.") : null,
+          a.errors.length ? h("div", null, h("b", null, "Odoo refused to apply. "), "The counts still wait in Physical Inventory (filter To Apply).") : null)));
+        if (a.errors.length) box.append(errorList(a.errors.map((m) => ({ row: null, line: null, message: m }))));
+      }
+      box.append(h("div", { class: "row" },
+        left || a.errors.length ? h("button", { type: "button", class: "btn small primary", onclick: () => openPhysicalInventory() }, "Review in Odoo") : null,
+        undoButton(entry), another));
+      return box;
+    }
+    const box = h("div", { class: "notice ok" }, h("span", { class: "big-ok" }, "✓"), h("div", { class: "grow" },
+      h("b", null, set),
+      h("div", null, h("b", null, "The stock isn't changed yet."), " The differences go into stock once the counts are applied (validated): review them in Odoo, or apply them now."),
+      h("div", { class: "row", style: "margin-top:8px" },
+        h("button", { type: "button", class: "btn small primary", title: "Opens Inventory › Physical Inventory filtered on To Apply: check the Difference column, then Apply", onclick: () => openPhysicalInventory() }, "Review & apply in Odoo"),
+        r.applyAsk ? null : h("button", { type: "button", class: "btn small", onclick: () => { r.applyAsk = true; render(); } }, "Apply now"),
+        undoButton(entry), another),
+      r.applyAsk ? applyForm(r, p, n) : null));
+    return box;
+  }
+
+  // "Apply now": what it will do, the reason Odoo puts on the moves, and the one click that does it.
+  function applyForm(r, p, n) {
+    const all = [...p.lines, ...p.zeros];
+    const up = all.filter((l) => l.diff > 0).length;
+    const down = all.filter((l) => l.diff < 0).length;
+    const net = p.stats.net;
+    const reason = h("input", { type: "text", value: `Physical Inventory${S.job.file ? ` · ${S.job.file}` : ""}`, style: "flex:1; min-width:200px", "aria-label": "Inventory reason" });
+    return h("div", { class: "apply-form" },
+      h("div", null, `${n} stock line${n === 1 ? "" : "s"}: ${up} go up, ${down} go down, ${all.length - up - down} unchanged · ${net > 0 ? "+" : ""}${net.toLocaleString()} units in all.`),
+      h("label", { class: "row small" }, "Inventory reason", reason),
+      h("div", { class: "muted small" }, "Odoo makes the stock moves now. They can't be undone from here: a wrong count is corrected by counting again."),
+      h("div", { class: "row" },
+        h("button", { type: "button", class: "btn small primary", onclick: () => applyCounts(r, reason.value.trim()) }, `Apply ${n} count${n === 1 ? "" : "s"}`),
+        h("button", { type: "button", class: "btn small ghost", onclick: () => { r.applyAsk = false; render(); } }, "Cancel")));
+  }
+
+  async function applyCounts(r, reason) {
+    const entry = r.entry;
+    if (!entry || S.op) return;
+    const started = performance.now();
+    let res = null;
+    await task("apply", "Applying the counts…", async (op) => {
+      S.progress = { phase: "apply", done: 0, total: 1, started };
+      render();
+      res = await OI.inventory.apply(op.client, entry, {
+        reason,
+        batchSize: Math.max(1, Number(S.settings.batchSize) || 500),
+        signal: op.ctrl.signal,
+        onProgress: (x) => {
+          if (S.op !== op) return;
+          S.progress = { ...x, started };
+          renderProgress();
+        },
+      });
+    }, { abortRequests: false });
+    S.progress = null;
+    if (res) {
+      r.apply = { ...res, reason };
+      r.applyAsk = false;
+      if (res.applied.length) {
+        entry.applied = { ids: [...((entry.applied && entry.applied.ids) || []), ...res.applied], at: Date.now(), reason };
+        await store.set(K.history, S.history);
+        // The Odoo view behind the panel shows the new stock (its filters stay).
+        bridge("reload");
+      }
+    }
+    render();
+  }
+
+  // Every stock line the count touches: on hand, counted, difference.
+  function countTable(p) {
+    const MAX = 300;
+    const all = [...p.lines, ...p.zeros];
+    const what = { update: "update", create: "new", zero: "counted 0" };
+    const fmt = (n) => (n > 0 ? `+${n}` : String(n));
+    const body = all.slice(0, MAX).flatMap((l) => [
+      h("tr", null,
+        h("td", { class: "ln" }, l.rows.length ? l.rows.map((r) => S.job.table.lines[r]).join(", ") : "—"),
+        h("td", null, l.productLabel), h("td", null, l.lotLabel || "", l.newLot ? h("span", { class: "tag" }, "new") : null), h("td", null, l.locationLabel),
+        h("td", { class: "num" }, l.onHand), h("td", { class: "num" }, h("b", null, l.counted)),
+        h("td", { class: `num ${l.diff > 0 ? "up" : l.diff < 0 ? "down" : ""}` }, l.diff ? fmt(l.diff) : "0"),
+        h("td", null, what[l.action])),
+      ...(l.others || []).map((q) => h("tr", { class: "muted" }, h("td", { class: "ln" }, ""), h("td", { colspan: "3" }, `↳ extra quant #${q.id} of the same stock`),
+        h("td", { class: "num" }, q.quantity), h("td", { class: "num" }, "0"), h("td", { class: "num" }, ""), h("td", null, "counted 0"))),
+    ]);
+    return h("div", null,
+      h("div", { class: "table-wrap", style: "max-height: 380px; margin-bottom: 10px" }, h("table", { class: "grid count-table" },
+        h("thead", null, h("tr", null, ["#", "Product", "Lot/Serial", "Location", "On hand", "Counted", "Difference", ""].map((x) => h("th", null, x)))),
+        h("tbody", null, body))),
+      all.length > MAX ? h("div", { class: "muted small" }, `First ${MAX} of ${all.length} stock lines.`) : null);
+  }
+
+  /* Physical Inventory with the To Apply filter on: the counts waiting to be applied. Opened as an
+   * action in the web client (page bridge), so the breadcrumb back from a line keeps the filter.
+   * Without the bridge, by its URL (all lines; the filter is a click). */
+  async function openPhysicalInventory() {
+    hide();
+    if (await bridge("open", { action: "stock.action_view_inventory_tree", context: { search_default_to_apply: 1 } })) return;
+    location.href = location.pathname.startsWith("/odoo") ? "/odoo/physical-inventory" : "/web#action=stock.action_view_inventory_tree";
+  }
+
   // One record opens its form, several open the model's list (newest records first there).
   function openRecords(model, ids) {
     hide();
@@ -1602,13 +1966,17 @@
       created: result.created,
       updated: result.updated.length,
       deps: result.deps || [],
+      // a stock count: the counts it replaced, to put them back (see inventory.undo)
+      count: result.count ? { mode: result.count.mode, prev: result.count.prev, created: result.count.created, zeroed: result.count.zeroed } : null,
       undone: false,
     };
+    result.entry = entry;
     S.history = [entry, ...S.history].slice(0, HISTORY_MAX);
     await store.set(K.history, S.history);
   }
 
   function undoButton(entry, label = "Undo") {
+    if (entry && entry.count) return undoCountButton(entry, label);
     if (!entry || entry.undone || (!entry.created.length && !(entry.deps || []).length)) return null;
     const n = entry.created.length + (entry.deps || []).reduce((s, d) => s + d.ids.length, 0);
     let armed = false;
@@ -1634,6 +2002,34 @@
     return btn;
   }
 
+  // A stock count is undone by putting the counts back (the stock itself never moved).
+  function undoCountButton(entry, label) {
+    const n = entry.count.prev.length + entry.count.created.length - (entry.applied ? entry.applied.ids.length : 0);
+    if (entry.undone) return null;
+    if (n <= 0) return h("button", { type: "button", class: "btn small", disabled: true, title: "The counts are applied: the stock moved. Correct it with a new count." }, label);
+    let armed = false;
+    let timer;
+    const btn = h("button", { type: "button", class: "btn small danger", onclick: async () => {
+      if (!armed) {
+        armed = true;
+        btn.textContent = `Take back ${n} counts? Click again`;
+        timer = setTimeout(() => { armed = false; btn.textContent = label; }, 4000);
+        return;
+      }
+      clearTimeout(timer);
+      btn.disabled = true;
+      btn.textContent = "Undoing…";
+      const errors = await S.deps.executor.undo(entry);
+      entry.undone = !errors.length;
+      await store.set(K.history, S.history);
+      toast(errors.length ? errors[0] : `${n} counts taken back`);
+      if (!historySheet.hidden) openHistory();
+      render();
+    } }, label);
+    btn.title = "Puts the counted quantities back as they were before this import. Counts already applied in Odoo stay.";
+    return btn;
+  }
+
   function timeAgo(t) {
     const s = Math.round((Date.now() - t) / 1000);
     if (s < 60) return "just now";
@@ -1649,8 +2045,9 @@
       h("div", { class: "body" },
         mine.length
           ? mine.map((e) => h("div", { class: "hist" },
-            h("div", { class: "what" }, h("b", null, `${e.modelName || e.model}`), ` · ${e.created.length} created, ${e.updated} updated`,
-              h("small", null, `${e.file || ""} · ${timeAgo(e.at)}${e.undone ? " · undone" : ""}`)),
+            h("div", { class: "what" }, h("b", null, `${e.modelName || e.model}`), e.count ? ` · stock count, ${e.count.prev.length + e.count.created.length} lines` : ` · ${e.created.length} created, ${e.updated} updated`,
+              h("small", null, `${e.file || ""} · ${timeAgo(e.at)}${e.undone ? " · undone" : ""}${e.applied ? ` · ${e.applied.ids.length} applied` : ""}`)),
+            e.count && !e.undone && S.model === OI.inventory.MODEL ? h("button", { type: "button", class: "btn small", title: "Physical Inventory, filtered on the counts to apply", onclick: () => openPhysicalInventory() }, "Review in Odoo") : null,
             undoButton(e)))
           : h("div", { class: "empty-state" }, "No imports on this database yet.")));
     historySheet.hidden = false;
@@ -1659,7 +2056,7 @@
   // ---------------------------------------------------------------------------
   // export
   const PURPOSES = {
-    data: { title: "Data", icon: "📊", text: "To read, share or analyse. Starts with the columns of the list view; headers are the field labels." },
+    data: { title: "Data", icon: "📊", text: "To read, share or analyse. Starts with the columns the list shows; headers are the field labels." },
     reimport: { title: "For re-importing", icon: "✏️", text: "To edit and import back. Keeps the External ID so the same records are updated; headers are technical names." },
   };
   const expKey = (purpose) => `oi.export.${location.origin}|${S.session ? S.session.db : ""}|${S.model}|${purpose}`;
@@ -1712,8 +2109,11 @@
     setBusy("Choosing columns…");
     try {
       const saved = reset ? null : await store.get(expKey(purpose), null);
-      const paths = saved || (await OI.export.defaultPaths(S.client, S.deps.schemas, S.model, purpose));
-      e.columns = await OI.export.describe(S.deps.schemas, S.model, paths, purpose);
+      // Saved lists were plain paths before columns could be unticked.
+      const page = pageScope();
+      const entries = saved ? saved.map((x) => (Array.isArray(x) ? { path: x, on: true } : x)) : await OI.export.defaultPaths(S.client, S.deps.schemas, S.model, purpose, page && page.columns);
+      const on = new Map(entries.map((x) => [x.path.join("/"), x.on !== false]));
+      e.columns = (await OI.export.describe(S.deps.schemas, S.model, entries.map((x) => x.path), purpose)).map((c) => ({ ...c, on: on.get(c.path.join("/")) }));
       setBusy("");
     } catch (err) {
       fail(err);
@@ -1722,7 +2122,16 @@
   }
 
   function saveColumns() {
-    store.set(expKey(S.exp.purpose), S.exp.columns.map((c) => c.path));
+    store.set(expKey(S.exp.purpose), S.exp.columns.map((c) => ({ path: c.path, on: c.on })));
+  }
+
+  // The columns that go in the file: the ticked ones, in the list's order.
+  const exportColumns = () => S.exp.columns.filter((c) => c.on);
+
+  function tickColumns(on) {
+    for (const c of S.exp.columns) c.on = on;
+    saveColumns();
+    render();
   }
 
   function moveColumn(i, d) {
@@ -1822,21 +2231,29 @@
       extra: (depth) => (depth === 0 ? [OI.schema.ID_FIELD] : []),
       marker: (path, f) => {
         const has = taken();
+        const present = e.columns.find((c) => c.path.join("/") === path.join("/"));
+        if (present && !present.on) return "unticked";
         return has.has(path.join("/")) || (f.type === "one2many" && [...has].some((k) => k.startsWith(`${f.name}/`))) ? "added" : null;
       },
       onpick: async (path, f) => {
-        if (taken().has(path.join("/"))) return toast("Already in the list");
+        const present = e.columns.find((c) => c.path.join("/") === path.join("/"));
+        if (present && present.on) return toast("Already in the list");
+        if (present) {
+          present.on = true; // listed, unticked: tick it
+          saveColumns();
+          return render();
+        }
         if (f.type === "one2many" && e.purpose === "data" && path.length === 1) {
           // A lines field brings its useful columns (Order Lines -> Product, Quantity, Price…),
           // one row per line. Only for data: re-importing lines onto existing records adds them again.
           const has = taken();
           const paths = (await OI.export.linePaths(S.client, S.deps.schemas, S.model, f)).filter((x) => !has.has(x.join("/")));
-          const cols = await OI.export.describe(S.deps.schemas, S.model, paths, e.purpose);
+          const cols = (await OI.export.describe(S.deps.schemas, S.model, paths, e.purpose)).map((c) => ({ ...c, on: true }));
           e.columns.push(...cols);
           toast(cols.length ? `Added ${f.string}: ${cols.map((c) => c.fields[c.fields.length - 1].string).join(", ")}` : "Already in the list");
         } else {
           const [col] = await OI.export.describe(S.deps.schemas, S.model, [path], e.purpose);
-          if (col) e.columns.push(col);
+          if (col) e.columns.push({ ...col, on: true });
         }
         saveColumns();
         render();
@@ -1986,19 +2403,21 @@
       h("span", { class: "chip manual" }, `${p.icon} ${p.title}`),
       h("button", { type: "button", class: "btn small ghost", onclick: () => { e.purpose = null; e.done = null; render(); } }, "Change"),
       h("span", { class: "spacer" }),
-      h("span", { class: "muted small" }, `${e.columns.length} column${e.columns.length === 1 ? "" : "s"}`),
-      h("button", { type: "button", class: "btn small ghost", onclick: () => choosePurpose(e.purpose, { reset: true }) }, "Reset to default")));
+      h("span", { class: "muted small" }, `${exportColumns().length} of ${e.columns.length} column${e.columns.length === 1 ? "" : "s"}`),
+      h("button", { type: "button", class: "btn small ghost", disabled: e.columns.every((c) => c.on), onclick: () => tickColumns(true) }, "Tick all"),
+      h("button", { type: "button", class: "btn small ghost", disabled: !exportColumns().length, onclick: () => tickColumns(false) }, "Untick all"),
+      h("button", { type: "button", class: "btn small ghost", title: "Back to the columns the list shows", onclick: () => choosePurpose(e.purpose, { reset: true }) }, "Reset to default")));
 
     const list = h("ol", { class: "columns" });
-    e.columns.forEach((c, i) => list.append(h("li", null,
+    e.columns.forEach((c, i) => list.append(h("li", { class: c.on ? "" : "off" },
+      h("input", { type: "checkbox", checked: c.on, "aria-label": `Export ${c.label}`, onchange: (ev) => { c.on = ev.target.checked; saveColumns(); render(); } }),
       h("span", { class: "grip" }, i + 1),
       h("span", { class: "label" }, c.label),
       h("span", { class: "tech" }, c.path.join("/")),
       h("button", { type: "button", class: "icon-btn", title: "Move up", "aria-label": `Move ${c.label} up`, disabled: i === 0, onclick: () => moveColumn(i, -1) }, "↑"),
-      h("button", { type: "button", class: "icon-btn", title: "Move down", "aria-label": `Move ${c.label} down`, disabled: i === e.columns.length - 1, onclick: () => moveColumn(i, 1) }, "↓"),
-      h("button", { type: "button", class: "icon-btn remove", title: "Remove", "aria-label": `Remove ${c.label}`, onclick: () => { e.columns.splice(i, 1); saveColumns(); render(); } }, "×"))));
+      h("button", { type: "button", class: "icon-btn", title: "Move down", "aria-label": `Move ${c.label} down`, disabled: i === e.columns.length - 1, onclick: () => moveColumn(i, 1) }, "↓"))));
     wrap.append(list, fieldAdder());
-    if (e.purpose === "reimport" && !e.columns.some((c) => c.path[0] === "id")) {
+    if (e.purpose === "reimport" && !exportColumns().some((c) => c.path[0] === "id")) {
       wrap.append(h("div", { class: "notice warn" }, h("span", null, "⚠"), h("div", { class: "grow" }, "Without the External ID column, importing the file back creates new records instead of updating these.")));
     }
 
@@ -2024,9 +2443,10 @@
 
   function runExport() {
     const e = S.exp;
-    if (!e.purpose || !e.columns.length) return;
+    const columns = exportColumns();
+    if (!e.purpose || !columns.length) return;
     return task("export", "Exporting…", async (op) => {
-      const data = await OI.export.fetchRows(op.client, S.model, e.columns, {
+      const data = await OI.export.fetchRows(op.client, S.model, columns, {
         archived: e.archived,
         domain: domainOf(),
         signal: op.ctrl.signal,
@@ -2040,7 +2460,6 @@
       const name = `${S.modelName.replace(/[\\/:*?"<>|]+/g, " ")}${e.purpose === "reimport" ? " (for import)" : ""} ${day}.${e.format}`;
       if (e.done) URL.revokeObjectURL(e.done.url);
       e.done = { records: data.records, rows: data.rows.length, name, url: URL.createObjectURL(blob) };
-      saveColumns();
       download(e.done.url, name);
       endTask();
       setBusy("");
@@ -2524,7 +2943,7 @@
       return;
     }
     // Start over (not while records are being saved: "Stop after this batch" is for that).
-    const importing = S.op && S.op.kind === "import";
+    const importing = S.op && (S.op.kind === "import" || S.op.kind === "apply");
     const work = S.mode === "import" ? !!(S.book || S.job)
       : S.mode === "export" ? !!(S.exp.purpose || S.filters.length || S.exp.archived)
         : !!(S.an.result || S.filters.length);
@@ -2552,12 +2971,12 @@
     if (S.mode === "export") {
       if (S.busy) status.append(h("span", { class: "spinner" }), " ", S.busy);
       else if (message) status.append(h("span", { style: isError ? "color: var(--danger)" : "" }, message));
-      else status.append(S.exp.purpose ? "Add or remove columns, pick a format, export." : "Choose what the file is for.");
+      else status.append(S.exp.purpose ? (exportColumns().length ? "Tick the columns to export, add fields, pick a format." : "Tick at least one column.") : "Choose what the file is for.");
       backBtn.hidden = true;
       const n = S.exp.count || 0;
       nextBtn.hidden = !S.exp.purpose;
       nextBtn.textContent = `Export ${n.toLocaleString()} record${n === 1 ? "" : "s"}`;
-      nextBtn.disabled = !!S.busy || !S.exp.columns.length || !n;
+      nextBtn.disabled = !!S.busy || !exportColumns().length || !n;
       return;
     }
     if (S.busy) status.append(h("span", { class: "spinner" }), " ", S.busy);
@@ -2578,7 +2997,12 @@
       nextBtn.textContent = "Look up values →";
     } else if (S.step === "review") {
       nextBtn.textContent = "Continue →";
-      nextBtn.disabled = !!S.busy || !S.analysis || S.analysis.conflicts.length > 0;
+      nextBtn.disabled = !!S.busy || !S.analysis || S.analysis.conflicts.length > 0 || (OI.inventory.active(S.job) && OI.inventory.problems(S.job).length > 0);
+    } else if (OI.inventory.active(S.job)) {
+      const n = S.count ? S.count.stats.total : 0;
+      nextBtn.textContent = `Set ${n} count${n === 1 ? "" : "s"}`;
+      nextBtn.disabled = !!S.busy || !n || S.count.errors.length > 0 || !!S.result || !!(S.check && !S.check.ok && !S.check.noDryRun);
+      nextBtn.hidden = !!(S.result && S.result.ok);
     } else {
       const n = S.analysis ? S.analysis.stats.create + S.analysis.stats.update : 0;
       nextBtn.textContent = `Import ${n} record${n === 1 ? "" : "s"}`;
