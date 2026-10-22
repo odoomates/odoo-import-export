@@ -30,7 +30,8 @@
       key: null, // {col, field, mode: "update" | "skip" | "create"}
       existing: new Map(), // lower(key value) -> [{id, label}]
       decisions: new Map(), // conflict key -> {action, id?, value?, label?}
-      defaults: new Map(), // field name -> {out, label}: constant for every record
+      defaults: new Map(), // field name -> {out, label, createOnly?}: constant for every record (or every new one)
+      modules: new Set(), // module names of the External ID key that are real Odoo modules
       requiredMissing: [], // required fields without column nor Odoo default
       inFile: new Map(), // col -> Map ref -> [rows]: rows of the file a self-referencing value can name
     };
@@ -147,6 +148,11 @@
     if (deps.onProgress) deps.onProgress("Looking for existing records…");
     const values = recordRows(job).map((i) => job.table.rows[i][job.key.col]);
     job.existing = await NS.records.findExisting(deps.client, job.model, job.key.field, values);
+    job.modules = new Set();
+    if (job.key.field === "id") {
+      const modules = values.map(NS.records.splitXmlid).filter(Boolean).map((p) => p[0]);
+      job.modules = await NS.records.realModules(deps.client, modules);
+    }
   }
 
   // Indices of rows that start a record. With one2many sub-columns, a row whose parent
@@ -177,7 +183,7 @@
     return m.fields.map((f) => f.string).join(" / ");
   }
 
-  /* Returns {conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts}.
+  /* Returns {conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts, newRows}.
    * Conflicts block the import until decided; warnings don't.
    * inFile: `${col}:${row}:${lower(value)}` -> the row whose new record the value links to;
    * levels: row -> import round (a record linking to a new record of the file goes after it). */
@@ -224,19 +230,6 @@
           candidates: [{ id: "DMY", label: "Day/Month/Year" }, { id: "MDY", label: "Month/Day/Year" }],
         });
       }
-    }
-
-    // 3. required fields without a column nor default. Odoo may still compute them (a sale
-    // order's invoice address comes from the customer), so this only warns: the dry run decides.
-    const mappedTop = new Set(maps.filter((m) => !isSub(m)).map((m) => m.path[0]));
-    for (const f of job.requiredMissing) {
-      if (mappedTop.has(f.name) || job.defaults.has(f.name)) continue;
-      warnings.push({
-        key: `requiredcol:${f.name}`, kind: "requiredcol", field: f, rows: [],
-        title: `Required field “${f.string}” has no column`,
-        message: "Odoo may fill it in (computed from other fields); otherwise set one value for every record. The check will tell.",
-        candidates: [],
-      });
     }
 
     const starts = new Set(recordRows(job));
@@ -325,6 +318,40 @@
       }
     }
 
+    // 4b. External IDs match in full (module.name). A row whose External ID doesn't exist creates
+    // a record under it: not under a real module's name, whose updates would manage the record.
+    const idIssue = new Set();
+    if (job.key && job.key.field === "id" && job.key.mode !== "create") {
+      const partial = [];
+      const owned = [];
+      for (const i of starts) {
+        const v = String(rows[i][job.key.col] ?? "").trim();
+        if (!v) continue;
+        const p = NS.records.splitXmlid(v);
+        if (!p) partial.push(i);
+        else if (!existingId(job, i) && job.modules.has(p[0])) owned.push(i);
+      }
+      const value = (list) => String(rows[list[0]][job.key.col]).trim();
+      const s = (list, one, many) => (list.length > 1 ? many : one);
+      if (partial.length && !decided("xmlid:partial")) {
+        partial.forEach((i) => idIssue.add(i));
+        push(conflicts, {
+          key: "xmlid:partial", kind: "xmlid", col: job.key.col, value: value(partial), rows: partial, candidates: [],
+          title: `${partial.length} External ID${s(partial, " isn't", "s aren't")} complete`,
+          message: `An External ID has two parts, module.name, and must match in full: “${value(partial)}” matches nothing. Write it in full (for a new record: __import__.${value(partial)}) or skip ${s(partial, "the row", "these rows")}.`,
+        });
+      }
+      if (owned.length && !decided("xmlid:module")) {
+        owned.forEach((i) => idIssue.add(i));
+        const v = value(owned);
+        push(conflicts, {
+          key: "xmlid:module", kind: "xmlid", col: job.key.col, value: v, rows: owned, candidates: [],
+          title: `${owned.length} External ID${s(owned, " doesn't", "s don't")} exist and name${s(owned, "s", "")} an Odoo module`,
+          message: `“${v}” would create a new record under the module “${v.split(".")[0]}”, which manages its own records. Check the External ID (a typo, another company, another database), give a new record one like __import__.${v.split(".").slice(1).join(".")}, or skip ${s(owned, "the row", "these rows")}.`,
+        });
+      }
+    }
+
     // 5. required fields mapped but empty on some records
     const skipRows = new Set();
     for (const [key, d] of job.decisions) {
@@ -390,6 +417,32 @@
             candidates: found.map((r) => ({ id: r.id, label: r.label, score: 1 })),
           });
         }
+      }
+    }
+
+    // 6b. required fields without a column nor default, on the records the import creates (an
+    // update only writes the columns of the file). Odoo may compute some (a sale order's invoice
+    // address comes from the customer): these only warn, the check decides. Next to updates, a
+    // field Odoo can't fill blocks: set one value for the new records, or skip them.
+    const mappedTop = new Set(maps.filter((m) => !isSub(m)).map((m) => m.path[0]));
+    const missing = job.requiredMissing.filter((f) => !mappedTop.has(f.name) && !job.defaults.has(f.name));
+    const live = [...starts].filter((i) => !skipRows.has(i) && existingTarget(job, i) !== "skip");
+    const creating = live.filter((i) => !existingTarget(job, i) && !idIssue.has(i));
+    const updating = live.some((i) => existingTarget(job, i));
+    const onlyUpdates = (decided("newrows") || {}).action === "skip" || missing.some((f) => (decided(`requiredcol:${f.name}`) || {}).action === "skip");
+    if (onlyUpdates) creating.forEach((i) => skipRows.add(i));
+    else if (creating.length) {
+      const n = creating.length;
+      const records = `${n} new record${n > 1 ? "s" : ""}`;
+      for (const f of missing) {
+        const blocks = updating && !f.computed;
+        push(blocks ? conflicts : warnings, {
+          key: `requiredcol:${f.name}`, kind: "requiredcol", field: f, rows: creating, candidates: [], updating,
+          title: blocks ? `${records} without “${f.string}”` : `Required field “${f.string}” has no column`,
+          message: blocks
+            ? `${n > 1 ? "These rows match" : "This row matches"} no existing record, so Odoo would create ${n > 1 ? "them" : "it"}, and a new record needs “${f.string}”. Skip ${n > 1 ? "them" : "it"} to import only the updates, or set one value for the new records.`
+            : `Odoo may fill it in (computed from other fields); otherwise set one value for the new records. The check will tell.`,
+        });
       }
     }
 
@@ -483,7 +536,8 @@
       else stats.create++;
     }
 
-    return { conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts };
+    const newRows = [...starts].filter((i) => !skipRows.has(i) && existingTarget(job, i) === null);
+    return { conflicts, warnings, conv, rowId, inFile, levels, skipRows, stats, starts, newRows };
   }
 
   // The id a relational column resolves to on a given row (for narrowing), if settled.
@@ -645,6 +699,7 @@
     }
 
     for (const [name, d] of job.defaults) {
+      if (d.createOnly && part === "update") continue; // new records only (see splitPasses)
       fields.push(d.path || name);
       columns.push(false);
       writers.push((i, isStart) => (isStart ? d.out : ""));
@@ -710,5 +765,11 @@
     return !!(job.key && job.key.mode === "update" && job.key.field !== "id" && job.key.field !== ".id");
   }
 
-  NS.plan = { needsDbId, newJob, active, relationOf, pieces, resolveAll, fileIndex, lookupExisting, recordRows, groups, analyze, build, xmlids, toCreate, existingTarget, existingId, isSub };
+  // Updates and creations go in separate passes: for the ".id" column, or for a value set for
+  // the new records only (in one matrix, its empty cells would wipe the field on the updates).
+  function splitPasses(job) {
+    return needsDbId(job) || !!(job.key && job.key.mode === "update" && [...job.defaults.values()].some((d) => d.createOnly));
+  }
+
+  NS.plan = { needsDbId, splitPasses, newJob, active, relationOf, pieces, resolveAll, fileIndex, lookupExisting, recordRows, groups, analyze, build, xmlids, toCreate, existingTarget, existingId, isSub };
 })();

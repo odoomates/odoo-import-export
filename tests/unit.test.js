@@ -876,11 +876,11 @@ test("stock count: column choice, lot names left to the count, key put aside", (
     eq(inv.columns(j), { product: 0, location: 2, lot: 1, package: null, owner: null, qty: 3, lotByName: true });
     eq(plan.analyze(j).conflicts.length, 0, "a lot name is matched per product by the count, not by name alone");
     eq(inv.problems(j), []);
-    j.key = { col: 0, field: "id", mode: "update" };
+    j.key = { col: 0, field: ".id", mode: "update" };
     inv.setMode(j, "overwrite");
     eq(j.key, null);
     eq(inv.setMode(j, "default"), true, "the key comes back for Odoo's default flow");
-    eq(j.key.field, "id");
+    eq(j.key.field, ".id");
     eq(plan.analyze(j).conflicts.map((c) => c.key), ["m2o:1:l-new"], "default flow: Odoo's own lot lookup");
     const k = countJob(["Product", "Lot"], [["Desk", ""]], [["product_id"], ["lot_id"]], { 0: { Desk: OK(1) } });
     eq(inv.problems(k), ["Map a column to Counted Quantity.", "Map a column to Location, or set one location for every row (Review step)."]);

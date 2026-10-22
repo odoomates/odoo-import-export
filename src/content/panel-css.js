@@ -223,7 +223,7 @@ table.grid td .arrow { color: var(--fg-3); }
 .card .title { font-weight: 600; display: flex; gap: 8px; align-items: center; }
 .card .title .kind { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; padding: 1px 6px; border-radius: 4px; background: var(--bg-3); color: var(--fg-2); }
 .card .title .kind.missing, .card .title .kind.value { background: var(--danger-bg); color: var(--danger); }
-.card .title .kind.ambiguous, .card .title .kind.column, .card .title .kind.dateorder, .card .title .kind.existing, .card .title .kind.requiredempty { background: var(--warn-bg); color: var(--warn); }
+.card .title .kind.ambiguous, .card .title .kind.column, .card .title .kind.dateorder, .card .title .kind.existing, .card .title .kind.requiredempty, .card .title .kind.xmlid { background: var(--warn-bg); color: var(--warn); }
 .card .title .kind.probable { background: var(--info-bg); color: var(--teal); }
 .card .msg { color: var(--fg-2); font-size: 12px; margin: 2px 0 8px; }
 .card .rows { color: var(--fg-3); font-size: 11px; margin-left: auto; font-weight: normal; white-space: nowrap; }

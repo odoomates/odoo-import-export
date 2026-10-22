@@ -42,15 +42,17 @@
     for (let i = 0; i < distinct.length; i += 200) {
       const part = distinct.slice(i, i + 200);
       if (field === "id") {
-        const domain = [["model", "=", model], ...Array(part.length - 1).fill("|"), ...part.flatMap((v) => {
-          const dot = v.indexOf(".");
-          const [module, name] = dot > 0 ? [v.slice(0, dot), v.slice(dot + 1)] : ["__import__", v];
+        // Only a full External ID (module.name) matches: "x" is not "__import__.x".
+        const full = part.filter(splitXmlid);
+        if (!full.length) continue;
+        const domain = [["model", "=", model], ...Array(full.length - 1).fill("|"), ...full.flatMap((v) => {
+          const [module, name] = splitXmlid(v);
           return ["&", ["module", "=", module], ["name", "=", name]];
         })];
         const rows = await client.call("ir.model.data", "search_read", [domain, ["module", "name", "res_id"]]);
         for (const r of rows) {
-          const full = `${r.module}.${r.name}`;
-          for (const v of part) if (v === full || (r.module === "__import__" && v === r.name)) push(v, { id: r.res_id, label: full });
+          const id = `${r.module}.${r.name}`;
+          for (const v of full) if (v === id) push(v, { id: r.res_id, label: id });
         }
       } else if (field === ".id") {
         const ids = part.filter((v) => /^\d+$/.test(v)).map(Number);
@@ -65,5 +67,26 @@
     return out;
   }
 
-  NS.records = { suggestKeys, findExisting, lower };
+  // "module.name" -> [module, name]; null when a part is missing.
+  function splitXmlid(v) {
+    const s = String(v ?? "").trim();
+    const dot = s.indexOf(".");
+    return dot > 0 && dot < s.length - 1 && !/\s/.test(s) ? [s.slice(0, dot), s.slice(dot + 1)] : null;
+  }
+
+  /* The names among `modules` that are Odoo modules (installed or not): a new record must not
+   * take one, the module's updates would manage it. Read from the modules' own External IDs
+   * (base.module_<name>), which every user can read. */
+  async function realModules(client, modules) {
+    const names = [...new Set(modules)].filter((m) => !m.startsWith("__"));
+    const out = new Set();
+    for (let i = 0; i < names.length; i += 200) {
+      const part = names.slice(i, i + 200).map((m) => `module_${m}`);
+      const rows = await client.call("ir.model.data", "search_read", [[["module", "=", "base"], ["model", "=", "ir.module.module"], ["name", "in", part]], ["name"]]);
+      for (const r of rows) out.add(r.name.slice("module_".length));
+    }
+    return out;
+  }
+
+  NS.records = { suggestKeys, findExisting, splitXmlid, realModules, lower };
 })();

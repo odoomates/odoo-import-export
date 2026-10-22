@@ -180,7 +180,7 @@
       // Updates and creations go in separate passes when rows are matched by a key, so the
       // ".id" column is only sent where every row has one. Records linking to new records of the
       // file go last (a dry run leaves these links empty: every batch is rolled back).
-      const passes = NS.plan.needsDbId(job) ? ["update", "create"] : [null];
+      const passes = NS.plan.splitPasses(job) ? ["update", "create"] : [null];
       let steps = passes.map((part) => ({ part }));
       let first = null;
       if (!dryrun && analysis.inFile && analysis.inFile.size) {

@@ -10,7 +10,7 @@
 
   const MAGIC = new Set(["create_uid", "create_date", "write_uid", "write_date", "__last_update", "id", "display_name"]);
   const UNSUPPORTED = new Set(["properties", "properties_definition", "json", "many2one_reference", "reference"]);
-  const ATTRS = ["string", "type", "relation", "required", "readonly", "selection", "store", "translate", "help"];
+  const ATTRS = ["string", "type", "relation", "required", "readonly", "selection", "store", "translate", "help", "depends"];
 
   // Pseudo fields every model accepts in an import.
   const ID_FIELD = { name: "id", string: "External ID", stringEn: "External ID", type: "id", required: false, readonly: false, importable: true };
@@ -39,6 +39,7 @@
             store: f.store !== false,
             translate: !!f.translate,
             help: f.help || "",
+            computed: Array.isArray(f.depends) && f.depends.length > 0, // computed or related: Odoo may fill it
             selection: Array.isArray(f.selection) ? f.selection : null,
             selectionEn: en[name] && Array.isArray(en[name].selection) ? en[name].selection : null,
           };

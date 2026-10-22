@@ -871,11 +871,13 @@
     table.append(tbody);
     wrap.append(table);
 
-    const req = job.requiredMissing.filter((f) => !job.mapping.some((m) => m.path && m.path[0] === f.name));
-    if (req.length) {
+    // Only new records need them: with an External / Database ID column the file likely updates.
+    const req = job.requiredMissing.filter((f) => !f.computed && !job.mapping.some((m) => m.path && m.path[0] === f.name));
+    const updates = job.mapping.some((m) => m.path && m.path.length === 1 && (m.path[0] === "id" || m.path[0] === ".id"));
+    if (req.length && !updates) {
       wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" },
-        h("b", null, "Required fields without a column: "), req.map((f) => f.string).join(", "),
-        h("div", { class: "small muted" }, "Odoo may compute them from other fields. If not, you can set one value for every record in the review step."))));
+        h("b", null, `New records need ${req.length > 1 ? "these fields" : "this field"}: `), req.map((f) => f.string).join(", "),
+        h("div", { class: "small muted" }, `Odoo requires ${req.length > 1 ? "them" : "it"} and your file has no column for ${req.length > 1 ? "them" : "it"}. Map a column above, or set one value for all new records in the review step.`))));
     }
     return wrap;
   }
@@ -1012,7 +1014,7 @@
     return `${lines.length > 1 ? "rows" : "row"} ${shown}${lines.length > 4 ? ` +${lines.length - 4}` : ""}`;
   }
 
-  const KIND_LABEL = { column: "column", dateorder: "date format", m2o: "", value: "value", requiredempty: "required", existing: "existing", duplicate: "duplicate", requiredcol: "required", archived: "archived", cycle: "circular", infile: "in this file" };
+  const KIND_LABEL = { column: "column", dateorder: "date format", m2o: "", value: "value", requiredempty: "required", existing: "existing", duplicate: "duplicate", requiredcol: "required", xmlid: "external id", archived: "archived", cycle: "circular", infile: "in this file" };
 
   function card(c, index, isWarning) {
     const kind = c.kind === "m2o" ? c.status : c.kind;
@@ -1079,10 +1081,14 @@
     } else if (c.kind === "cycle") {
       actions.append(emptyBtn(c, c.field), skipBtn(c));
     } else if (c.kind === "requiredcol") {
+      const n = c.rows.length;
       actions.append(valueSetter(c.field, (out, label) => {
-        S.job.defaults.set(c.field.name, { out, label, path: c.field.type === "many2one" ? `${c.field.name}/.id` : c.field.name });
+        S.job.defaults.set(c.field.name, { out, label, path: c.field.type === "many2one" ? `${c.field.name}/.id` : c.field.name, createOnly: true });
         reanalyze();
-      }, "Use for every record"));
+      }, n > 1 ? "Use for the new records" : "Use for the new record"));
+      if (c.updating) actions.append(h("button", { type: "button", class: "btn small danger", title: "Press S", onclick: () => decide(c, { action: "skip" }) }, `Skip ${n > 1 ? `${n} new records` : "the new record"}, update the rest`));
+    } else if (c.kind === "xmlid") {
+      actions.append(skipBtn(c));
     }
     if (cands.childElementCount) el.append(cands);
     if (actions.childElementCount) el.append(actions);
@@ -1226,6 +1232,9 @@
       pick: `→ ${d.label || `#${d.id}`}`, create: `→ create “${d.value}”`, empty: "→ left empty", skip: `→ ${d.rows ? d.rows.length : ""} row(s) skipped`,
       value: `→ “${d.value}”`, default: `→ ${d.label}`, first: "→ first row kept", last: "→ last row kept", all: "→ all rows kept",
     }[d.action] || d.action;
+    if (kind === "newrows") return "Rows matching no existing record → skipped";
+    if (kind === "requiredcol") return `New records without ${what} ${act}`;
+    if (kind === "xmlid") return `${what === "partial" ? "Incomplete External IDs" : "External IDs naming a module"} ${act}`;
     if (kind === "cycle") {
       const [, c, row] = key.split(":");
       return `${S.job.table.headers[Number(c)]}, row ${S.job.table.lines[Number(row)]}: circular link ${act}`;
@@ -1251,6 +1260,13 @@
       a.warnings.length ? h("div", { class: "stat warn" }, h("b", null, a.warnings.length), "warnings") : null,
       h("span", { class: "spacer" }),
       counting ? null : keyControl()));
+    if (!counting && a.stats.update && a.newRows.length) {
+      const n = a.newRows.length;
+      wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" },
+        h("b", null, `${a.stats.update.toLocaleString()} existing record${a.stats.update > 1 ? "s" : ""} will be updated, ${n.toLocaleString()} new one${n > 1 ? "s" : ""} created.`),
+        h("div", { class: "small muted" }, `${rowsText(a.newRows)} ${n > 1 ? "match" : "matches"} no existing record by ${job.key.label || job.key.field}.`)),
+        h("button", { type: "button", class: "btn small", onclick: () => { job.decisions.set("newrows", { action: "skip" }); reanalyze(); } }, "Update only, skip the new ones")));
+    }
     if (job.model === OI.inventory.MODEL && counts()) wrap.append(countModes());
 
     const tabs = h("div", { class: "tabs", role: "tablist" },
@@ -1331,7 +1347,7 @@
         }
       }
       for (const [name, d] of defaults) {
-        det.append(h("div", { class: "decided" }, h("span", { class: "what" }, `Every record: ${name} → ${d.label}`), h("button", { type: "button", class: "btn small ghost", onclick: () => { job.defaults.delete(name); reanalyze(); } }, "Undo")));
+        det.append(h("div", { class: "decided" }, h("span", { class: "what" }, `${d.createOnly ? "New records" : "Every record"}: ${name} → ${d.label}`), h("button", { type: "button", class: "btn small ghost", onclick: () => { job.defaults.delete(name); reanalyze(); } }, "Undo")));
       }
       wrap.append(det);
     }
