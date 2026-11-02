@@ -85,10 +85,10 @@
     }
 
     // Required fields that get a value anyway: Odoo defaults for this user/company.
-    async function defaults(model, names) {
+    async function defaults(model, names, context = {}) {
       if (!names.length) return {};
       try {
-        return (await client.call(model, "default_get", [names])) || {};
+        return (await client.call(model, "default_get", [names], {}, context)) || {};
       } catch {
         return {};
       }

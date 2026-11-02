@@ -378,6 +378,14 @@
     return JSON.stringify([S.page, S.scope]) !== before;
   }
 
+  /* The context of the menu the page was opened from, for importing into `model`. Not for stock
+   * counts: they set their own (the menu's inventory_mode changes how a quant is created). */
+  async function menuContext(model) {
+    if (model === "stock.quant") return {};
+    const page = await pageContext();
+    return page && page.model === model ? OI.pipeline.importContext(page.context) : {};
+  }
+
   const pageScope = () => (S.page && S.page.model === S.model ? S.page : null);
 
   // The model of the page the user is on: /odoo/<path>, /odoo/action-<id|xmlid>, /odoo/<model>, #model=.
@@ -568,7 +576,7 @@
     // en_US reads 03/04 as month/day; most other languages day/month.
     const dateOrder = /^en_(US|PH|CA)$/.test(lang) ? "MDY" : "DMY";
     await task("prepare", "Matching columns to fields…", async (op) => {
-      const job = await OI.pipeline.prepare(op.deps, S.model, table, { dateOrder });
+      const job = await OI.pipeline.prepare(op.deps, S.model, table, { dateOrder, context: await menuContext(S.model) });
       if (!alive(op)) return;
       S.job = job;
       S.job.file = S.book.name;
@@ -761,7 +769,7 @@
 
   function downloadTemplate() {
     return task("template", "Building the template…", async (op) => {
-      const t = await OI.template.build(op.client, S.deps.schemas, S.model, S.modelName);
+      const t = await OI.template.build(op.client, S.deps.schemas, S.model, S.modelName, await menuContext(S.model));
       if (!alive(op)) return;
       const blob = await OI.xlsxwriter.book({ sheets: t.sheets });
       if (!alive(op)) return;
@@ -875,6 +883,12 @@
     }
     table.append(tbody);
     wrap.append(table);
+
+    if (job.contextDefaults.length) {
+      wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" },
+        h("b", null, "From this menu, new records get: "), job.contextDefaults.map((d) => (d.value === null ? d.string : `${d.string}: ${d.value}`)).join(", "),
+        h("div", { class: "small muted" }, "Map a column above to set your own values."))));
+    }
 
     // Only new records need them: with an External / Database ID column the file likely updates.
     const req = job.requiredMissing.filter((f) => !f.computed && !job.mapping.some((m) => m.path && m.path[0] === f.name));
@@ -1640,7 +1654,7 @@
           dryrun,
           batchSize: Math.max(1, Number(S.settings.batchSize) || 500),
           signal: op.ctrl.signal,
-          context: S.settings.fast ? { tracking_disable: true } : {},
+          context: { ...job.context, ...(S.settings.fast ? { tracking_disable: true } : {}) },
           onProgress: (p) => {
             if (S.op !== op) return;
             S.progress = { ...p, started: S.progress.started };

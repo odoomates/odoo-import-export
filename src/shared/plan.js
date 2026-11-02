@@ -34,6 +34,8 @@
       decisions: new Map(), // conflict key -> {action, id?, value?, label?}
       defaults: new Map(), // field name -> {out, label, createOnly?}: constant for every record (or every new one)
       modules: new Set(), // module names of the External ID key that are real Odoo modules
+      context: {}, // the context of the menu the import started from (default_move_type, ...)
+      contextDefaults: [], // [{name, string, value}]: what that context gives new records
       requiredMissing: [], // required fields without column nor Odoo default
       inFile: new Map(), // col -> Map ref -> [rows]: rows of the file a self-referencing value can name
     };

@@ -52,6 +52,14 @@
     }
   }
 
+  function plainObject(value) {
+    try {
+      return JSON.parse(JSON.stringify(value || {}));
+    } catch {
+      return {};
+    }
+  }
+
   /* The columns of the list renderer showing `list`, in screen order: shown (optional columns
    * as the user toggled them) and hidden (optional columns switched off). The renderer keeps
    * them in allColumns, and the shown ones in columns (Odoo 18+) or state.columns (16, 17). */
@@ -85,6 +93,8 @@
     return {
       model,
       domain: search ? plain(search.domain) : [],
+      // The menu's context (default_move_type on Vendor Bills, ...) with the active filters' own.
+      context: search ? plainObject(search.context) : {},
       selectedIds: selected,
       // "Select all" ticked across pages: the whole search, not just the visible rows
       domainSelected: !!(list && list.isDomainSelected),

@@ -1253,4 +1253,41 @@ await atest("rematch: only unmatched, undecided values; back to automatic", asyn
     ok(!plan.canRematch(j, 1), "only product columns");
 });
 
+// ---------------------------------------------------------------------------
+// the menu's context
+const { pipeline } = globalThis.OdooImport;
+
+test("import context keeps the menu's values, not the view's or the session's", () => {
+    eq(pipeline.importContext({
+        default_move_type: "in_invoice", display_account_trigger: true, active_id: 7,
+        search_default_posted: 1, searchpanel_default_x: 2, group_by: ["a"], orderedBy: [],
+        lang: "fr_FR", tz: "UTC", uid: 2, allowed_company_ids: [1],
+    }), { default_move_type: "in_invoice", display_account_trigger: true, active_id: 7 });
+    eq(pipeline.importContext(undefined), {});
+});
+
+await atest("the menu's defaults reach default_get and are listed, unless a column fills them", async () => {
+    const fields = new Map([
+        ["move_type", F("move_type", "selection", "Type", { required: true, selection: [["entry", "Journal Entry"], ["in_invoice", "Vendor Bill"]] })],
+        ["journal_id", F("journal_id", "many2one", "Journal", { relation: "account.journal" })],
+        ["ref", F("ref", "char", "Reference")],
+    ]);
+    const seen = [];
+    const deps = { schemas: {
+        load: async () => ({ fields }),
+        defaults: async (model, names, context) => { seen.push(context); return { move_type: context.default_move_type }; },
+    } };
+    const j = { model: "account.move", mapping: [{ col: 0, path: ["ref"] }], context: { default_move_type: "in_invoice", default_journal_id: 3, default_nope: 1, default_ref: "x", other: 1 } };
+    await pipeline.updateRequired(deps, j);
+    eq(seen, [j.context]);
+    eq(j.fieldDefaults.move_type, "in_invoice");
+    eq(j.contextDefaults, [
+        { name: "move_type", string: "Type", value: "Vendor Bill" },
+        { name: "journal_id", string: "Journal", value: null },
+    ]);
+    j.mapping.push({ col: 1, path: ["move_type"] });
+    await pipeline.updateRequired(deps, j);
+    eq(j.contextDefaults.map((d) => d.name), ["journal_id"]);
+});
+
 finish();

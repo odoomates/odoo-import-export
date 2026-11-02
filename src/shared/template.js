@@ -75,12 +75,12 @@
   }
 
   /* -> {sheets, fileName, templates: [{label, url}]} for xlsxwriter.book. */
-  async function build(client, schemas, model, modelName) {
+  async function build(client, schemas, model, modelName, context = {}) {
     const schema = await schemas.load(model);
     const fields = schema.fields;
     const importable = (n) => fields.has(n) && fields.get(n).importable && !SKIP.has(fields.get(n).type);
     const required = [...fields.values()].filter((f) => f.required && importable(f.name)).map((f) => f.name);
-    const defaults = await schemas.defaults(model, required);
+    const defaults = await schemas.defaults(model, required, context);
     const mustFill = required.filter((n) => !(n in defaults) || defaults[n] === false || defaults[n] === null);
     const onForm = (await formFields(client, model)).filter(importable);
     const first = fields.has("name") && importable("name") ? ["name"] : [];

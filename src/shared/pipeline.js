@@ -21,9 +21,32 @@
     };
   }
 
+  /* What of a page's context goes with an import. Odoo's own Import sends the whole context of
+   * the view; here without what only describes the view (it has no bearing on new records) or
+   * the session (the panel sends the user's own). */
+  const VIEW_CONTEXT = /^(search_default_|searchpanel_default_|group_by$|orderedBy$|lang$|tz$|uid$|allowed_company_ids$)/;
+  function importContext(context) {
+    return Object.fromEntries(Object.entries(context || {}).filter(([k]) => !VIEW_CONTEXT.test(k)));
+  }
+
+  /* The values the context gives new records, for fields no column fills: [{name, string, value}].
+   * A selection shows its label; a relation only its field, the context holds just an id. */
+  function contextDefaults(schema, job, mapped) {
+    const out = [];
+    for (const [key, v] of Object.entries(job.context)) {
+      const f = key.startsWith("default_") ? schema.fields.get(key.slice(8)) : null;
+      if (!f || mapped.has(f.name) || v === false || v === null) continue;
+      const option = f.selection && f.selection.find((o) => o[0] === v);
+      const shown = f.type === "many2one" || typeof v === "object" ? null : option ? option[1] : String(v);
+      out.push({ name: f.name, string: f.string, value: shown });
+    }
+    return out;
+  }
+
   // Profile every column and map columns to fields.
-  async function prepare(deps, model, table, { dateOrder } = {}) {
+  async function prepare(deps, model, table, { dateOrder, context = {} } = {}) {
     const job = NS.plan.newJob(model, table);
+    job.context = context;
     job.profiles = table.headers.map((_, c) => NS.profile.profileColumn(table.rows.map((r) => r[c]), { dateOrder }));
     const fields = await deps.schemas.importable(model);
     const mapping = await NS.columns.automap({
@@ -68,7 +91,8 @@
     const required = [...s.fields.values()].filter((f) => f.required && f.importable);
     const mapped = new Set(job.mapping.filter((m) => m.path).map((m) => m.path[0]));
     const unmapped = required.filter((f) => !mapped.has(f.name));
-    const defaults = await deps.schemas.defaults(job.model, required.map((f) => f.name));
+    job.contextDefaults = contextDefaults(s, job, mapped);
+    const defaults = await deps.schemas.defaults(job.model, required.map((f) => f.name), job.context);
     job.requiredMissing = unmapped.filter((f) => !hasDefault(f, defaults));
     // Odoo's defaults for required fields, as import values: an empty cell on a new record gets
     // them (an empty Company column must not leave the order without a company).
@@ -135,5 +159,5 @@
     }
   }
 
-  NS.pipeline = { makeDeps, prepare, setPath, updateRequired, resolve, creatable };
+  NS.pipeline = { makeDeps, importContext, prepare, setPath, updateRequired, resolve, creatable };
 })();
