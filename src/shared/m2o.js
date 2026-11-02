@@ -49,6 +49,101 @@
 
   const SMALL = 3000; // comodels up to this size are fuzzy-matched locally
 
+  function makeCandidate(records, id, score, linkFields, keys) {
+    const r = records.get(id) || { id, display_name: `#${id}` };
+    const links = {};
+    for (const f of [...linkFields, "company_id"]) if (Array.isArray(r[f])) links[f] = r[f][0];
+    const detail = [
+      ...keys.filter((k) => r[k] && lower(r[k]) !== lower(r.display_name)).map((k) => r[k]),
+      Array.isArray(r.company_id) ? r.company_id[1] : null,
+      r.active === false ? "archived" : null,
+    ].filter(Boolean).join(" · ");
+    return { id, label: r.display_name, score, active: r.active !== false, links, detail };
+  }
+
+  // No exact match: one close candidate that stands out is probable, otherwise missing.
+  function fromFuzzy(fz) {
+    fz.sort((a, b) => b.score - a.score);
+    const [best, second] = fz;
+    const candidates = fz.filter((c) => c.score >= 0.35).slice(0, 5);
+    if (best && best.score >= PROBABLE && (!second || second.score < best.score - 0.08)) {
+      return { status: "probable", id: best.id, source: "fuzzy", candidates };
+    }
+    return { status: "missing", id: null, source: "", candidates };
+  }
+
+  // Exact matches: one record (or one active among archived ones) is ok, several are ambiguous.
+  function fromExact(cands, source) {
+    const active = cands.filter((c) => c.active);
+    if (cands.length === 1) return { status: cands[0].active ? "ok" : "archived", id: cands[0].id, source, candidates: cands };
+    if (active.length === 1) return { status: "ok", id: active[0].id, source, candidates: cands };
+    return { status: "ambiguous", id: null, source, candidates: active.length ? active : cands };
+  }
+
+  /* Product columns: when values aren't found, the user says how they are written and they
+   * are searched that way only (resolveAs). Code formats look the code up, then compare the
+   * name part with the product found: a different name makes it a close match to confirm. */
+  const PRODUCT_MODELS = new Set(["product.product", "product.template"]);
+  const isProduct = (relation) => PRODUCT_MODELS.has(relation);
+  const PRODUCT_FORMATS = [
+    { id: "name", label: "Name" },
+    { id: "code", label: "Internal reference (code)" },
+    { id: "barcode", label: "Barcode" },
+    { id: "bracket", label: "[Code] Name", re: /^\[\s*(?<code>[^\]]+?)\s*\]\s*(?<name>.*)$/ },
+    { id: "dash", label: "Code - Name", re: /^(?<code>\S+?)\s*[-–—|:]\s+(?<name>.+)$/ },
+    { id: "paren", label: "Name (Code)", re: /^(?<name>.+?)\s*[([]\s*(?<code>[^)\]]+?)\s*[)\]]$/ },
+    { id: "space", label: "Code Name (first word is the code)", re: /^(?<code>\S+)\s+(?<name>.+)$/ },
+    { id: "xmlid", label: "External ID" },
+  ];
+  const NAME_MATCH = 0.6; // name part vs the name of the product its code found
+
+  // Spreadsheet damage on codes: "1001.0" -> "1001", "8.71234E+12" -> "8712340000000".
+  function cleanCode(v) {
+    const s = String(v ?? "").trim();
+    if (/^\d+\.0+$/.test(s)) return s.replace(/\.0+$/, "");
+    if (/^\d(\.\d+)?e\+?\d+$/i.test(s)) {
+      const n = Number(s);
+      if (Number.isFinite(n) && n < 1e21) return BigInt(Math.round(n)).toString();
+    }
+    return s;
+  }
+
+  // A barcode that lost its leading zeros: also try it padded to the EAN/UPC lengths.
+  function barcodeVariants(code) {
+    const out = [code];
+    if (/^\d+$/.test(code)) for (const n of [8, 12, 13, 14]) if (n > code.length) out.push(code.padStart(n, "0"));
+    return out;
+  }
+
+  /* What to search for a value written in `format`: {code, name} | {name} | {xmlid}, or null
+   * when the value doesn't fit the format. */
+  function splitValue(format, value) {
+    const v = String(value ?? "").trim();
+    if (!v) return null;
+    if (format === "name") return { name: v };
+    if (format === "code" || format === "barcode") return { code: cleanCode(v) };
+    if (format === "xmlid") return XMLID.test(v) && !/\s/.test(v) ? { xmlid: v } : null;
+    const f = PRODUCT_FORMATS.find((x) => x.id === format);
+    const m = f && f.re && f.re.exec(v);
+    if (!m) return null;
+    const code = cleanCode(m.groups.code);
+    return code ? { code, name: m.groups.name.trim() } : null;
+  }
+
+  // The format most of the values fit (a suggestion: nothing is searched until the user asks).
+  function guessFormat(values) {
+    const score = new Map(PRODUCT_FORMATS.map((f) => [f.id, 0]));
+    for (const raw of values) {
+      const v = String(raw ?? "").trim();
+      if (!v) continue;
+      const id = splitValue("xmlid", v) ? "xmlid"
+        : ["bracket", "paren", "dash"].find((f) => splitValue(f, v))
+          || (/^\d{8,14}$/.test(cleanCode(v)) ? "barcode" : !/\s/.test(v) && /\d/.test(v) ? "code" : /\s/.test(v) && /\d/.test(v.split(/\s/)[0]) ? "space" : "name");
+      score.set(id, score.get(id) + 1);
+    }
+    return [...score].reduce((best, cur) => (cur[1] > best[1] ? cur : best))[0];
+  }
+
   function createResolver(client, schemas) {
     const ALL = { active_test: false };
     const names = new Map(); // relation -> Promise<[{id, label}] | null>
@@ -124,6 +219,16 @@
           const byXmlid = new Map(rows.map((r) => [`${r.module}.${r.name}`, r.res_id]));
           for (const v of part) if (byXmlid.has(v)) add(v, byXmlid.get(v), "xmlid");
         }
+        // Products: an External ID of the other product model (a template's in a variant
+        // column: its variant, or its variants to pick from; a variant's: its template).
+        const across = isProduct(relation) ? xmlids.filter((v) => !exact.get(v).size) : [];
+        if (across.length) {
+          const res = await resolveAs({ relation, values: across, format: "xmlid", signal });
+          for (const v of across) {
+            const r = res.get(v);
+            if (r && r.status !== "missing") for (const c of r.candidates) add(v, c.id, "xmlid");
+          }
+        }
         const xmlIds = [...exact.values()].flatMap((m) => [...m.keys()]).filter((id) => !records.has(id));
         if (xmlIds.length) await searchRead([["id", "in", xmlIds]]);
       }
@@ -140,6 +245,9 @@
         const terms = part.map((v) => lookup.get(v));
         const leaves = terms.map((t) => ["display_name", "=ilike", escapeLike(t)]);
         if (has("name") && ["char", "text"].includes(schema.fields.get("name").type)) leaves.push(["name", "in", terms]);
+        // "[FURN_0002] Desk Pad": Odoo looks the bracketed code up as written, so the escaped
+        // "=ilike" term ("FURN\_0002") misses it; "in" passes the code unescaped.
+        if (isProduct(relation)) leaves.push(["display_name", "in", terms]);
         let rows;
         try {
           rows = await searchRead(orDomain(leaves));
@@ -209,15 +317,7 @@
       return finish(fuzzy);
 
       function candidate(id, score) {
-        const r = records.get(id) || { id, display_name: `#${id}` };
-        const links = {};
-        for (const f of [...linkFields, "company_id"]) if (Array.isArray(r[f])) links[f] = r[f][0];
-        const detail = [
-          ...keys.filter((k) => r[k] && lower(r[k]) !== lower(r.display_name)).map((k) => r[k]),
-          Array.isArray(r.company_id) ? r.company_id[1] : null,
-          r.active === false ? "archived" : null,
-        ].filter(Boolean).join(" · ");
-        return { id, label: r.display_name, score, active: r.active !== false, links, detail };
+        return makeCandidate(records, id, score, linkFields, keys);
       }
 
       function finish(fuzzyMap = new Map()) {
@@ -225,29 +325,145 @@
         for (const v of distinct) {
           const ex = exact.get(v);
           if (ex.size) {
-            const cands = [...ex.keys()].map((id) => candidate(id, 1));
-            const active = cands.filter((c) => c.active);
-            const source = [...ex.values()][0];
-            if (cands.length === 1) out.set(v, { status: cands[0].active ? "ok" : "archived", id: cands[0].id, source, candidates: cands });
-            else if (active.length === 1) out.set(v, { status: "ok", id: active[0].id, source, candidates: cands });
-            else out.set(v, { status: "ambiguous", id: null, source, candidates: active.length ? active : cands });
+            out.set(v, fromExact([...ex.keys()].map((id) => candidate(id, 1)), [...ex.values()][0]));
             continue;
           }
-          const fz = (fuzzyMap.get(v) || []).map((c) => ({ ...candidate(c.id, c.score), score: c.score }));
-          fz.sort((a, b) => b.score - a.score);
-          const [best, second] = fz;
-          if (best && best.score >= PROBABLE && (!second || second.score < best.score - 0.08)) {
-            out.set(v, { status: "probable", id: best.id, source: "fuzzy", candidates: fz.filter((c) => c.score >= 0.35).slice(0, 5) });
-          } else {
-            out.set(v, { status: "missing", id: null, source: "", candidates: fz.filter((c) => c.score >= 0.35).slice(0, 5) });
-          }
+          out.set(v, fromFuzzy((fuzzyMap.get(v) || []).map((c) => ({ ...candidate(c.id, c.score), score: c.score }))));
         }
         return out;
       }
     }
 
-    return { resolve };
+    /* Product values searched in the format the user picked (PRODUCT_FORMATS id). Codes and
+     * barcodes are looked up on the variants, so a template column also finds the templates
+     * of several variants; an External ID of the other product model is followed across.
+     * Returns Map raw -> result, like resolve(); a result may carry a `note`. */
+    async function resolveAs({ relation, values, format, linkFields = [], signal }) {
+      const check = () => NS.rpc.throwIfAborted(signal);
+      const P = "product.product";
+      const T = "product.template";
+      const tmpl = relation === T;
+      const schema = await schemas.load(relation);
+      const keys = ["default_code", "barcode"].filter((f) => schema.fields.has(f));
+      const readFields = [...new Set(["display_name", ...["name", "active", "company_id", ...keys, ...linkFields].filter((f) => schema.fields.has(f))])];
+      const distinct = [...new Set(values.map((v) => String(v).trim()).filter(Boolean))];
+      const parts = new Map(distinct.map((v) => [v, splitValue(format, v)]));
+      const found = new Map(distinct.map((v) => [v, new Set()]));
+      const fuzzy = new Map();
+      const records = new Map();
+      const source = `format:${format}`;
+
+      async function read(ids) {
+        for (const part of chunks([...new Set(ids)].filter((id) => !records.has(id)), 500)) {
+          for (const r of await client.call(relation, "read", [part, readFields], {}, ALL)) records.set(r.id, r);
+        }
+      }
+      // Variants whose `field` is one of the terms of a value -> the value's target ids.
+      async function byVariantKey(field, termsOf) {
+        const left = distinct.filter((v) => !found.get(v).size && termsOf(v).length);
+        for (const part of chunks(left)) {
+          check();
+          const terms = [...new Set(part.flatMap((v) => termsOf(v)))];
+          const rows = await client.call(P, "search_read", [[[field, "in", terms]], [field, "product_tmpl_id"]], { limit: 2000 }, ALL);
+          for (const v of part) {
+            const wanted = new Set(termsOf(v).map(lower));
+            for (const r of rows) if (r[field] && wanted.has(lower(r[field]))) found.get(v).add(tmpl ? r.product_tmpl_id[0] : r.id);
+          }
+        }
+      }
+      async function fuzzyName(v, term) {
+        const ids = new Map();
+        for (const [id, label] of await client.call(relation, "name_search", [term, [], "ilike", 8]).catch(() => [])) ids.set(id, label);
+        fuzzy.set(v, [...ids].map(([id, label]) => ({ id, label, term })));
+      }
+
+      if (format === "xmlid") {
+        const xmlids = distinct.filter((v) => parts.get(v));
+        for (const part of chunks(xmlids)) {
+          check();
+          const domain = [
+            ["model", "in", [P, T]],
+            ...Array(part.length - 1).fill("|"),
+            ...part.flatMap((v) => {
+              const i = v.indexOf(".");
+              return ["&", ["module", "=", v.slice(0, i)], ["name", "=", v.slice(i + 1)]];
+            }),
+          ];
+          const rows = await client.call("ir.model.data", "search_read", [domain, ["module", "name", "model", "res_id"]]);
+          const other = rows.filter((r) => r.model !== relation).map((r) => r.res_id);
+          // The other model's records, mapped to ours: a variant's template, a template's variants.
+          const across = new Map();
+          if (other.length) {
+            const linked = tmpl
+              ? await client.call(P, "read", [other, ["product_tmpl_id"]], {}, ALL)
+              : await client.call(P, "search_read", [[["product_tmpl_id", "in", other]], ["product_tmpl_id"]], {}, ALL);
+            for (const r of linked) {
+              const from = tmpl ? r.id : r.product_tmpl_id[0];
+              if (!across.has(from)) across.set(from, []);
+              across.get(from).push(tmpl ? r.product_tmpl_id[0] : r.id);
+            }
+          }
+          for (const r of rows) {
+            const v = `${r.module}.${r.name}`;
+            if (!found.has(v)) continue;
+            for (const id of r.model === relation ? [r.res_id] : across.get(r.res_id) || []) found.get(v).add(id);
+          }
+        }
+      } else if (format === "name") {
+        for (const part of chunks(distinct)) {
+          check();
+          const rows = await client.call(relation, "search_read", [orDomain(part.map((v) => ["name", "=ilike", escapeLike(v)])), ["name"]], { limit: 2000 }, ALL);
+          for (const v of part) for (const r of rows) if (lower(r.name) === lower(v)) found.get(v).add(r.id);
+        }
+        await pool(distinct.filter((v) => !found.get(v).size).slice(0, FUZZY_MAX), 6, (v) => (check(), fuzzyName(v, v)), signal);
+      } else {
+        const code = (v) => (parts.get(v) ? [parts.get(v).code] : []);
+        const cased = (v) => code(v).flatMap((c) => [c, c.toLowerCase(), c.toUpperCase()]);
+        const padded = (v) => code(v).flatMap(barcodeVariants);
+        if (format === "barcode") await byVariantKey("barcode", padded);
+        else {
+          await byVariantKey("default_code", cased);
+          // A code that is in fact a barcode.
+          if (format !== "code") await byVariantKey("barcode", padded);
+        }
+        // Code not found: the name part (if any) may still be close to a product.
+        const left = distinct.filter((v) => !found.get(v).size && parts.get(v) && parts.get(v).name).slice(0, FUZZY_MAX);
+        await pool(left, 6, (v) => (check(), fuzzyName(v, parts.get(v).name)), signal);
+      }
+      check();
+      await read([...found.values()].flatMap((s) => [...s]).concat([...fuzzy.values()].flat().map((c) => c.id)));
+
+      const out = new Map();
+      for (const v of distinct) {
+        const ids = [...found.get(v)];
+        if (!ids.length) {
+          // Scored on the product name too: name_search labels carry the code ("[A1] Desk").
+          out.set(v, fromFuzzy((fuzzy.get(v) || []).map((c) => {
+            const r = records.get(c.id);
+            const score = Math.max(similarity(c.term, c.label), r && r.name ? similarity(c.term, r.name) : 0);
+            return makeCandidate(records, c.id, score, linkFields, keys);
+          })));
+          continue;
+        }
+        const res = fromExact(ids.map((id) => makeCandidate(records, id, 1, linkFields, keys)), source);
+        const name = parts.get(v) && parts.get(v).code ? parts.get(v).name : "";
+        const r = res.id && records.get(res.id);
+        if (name && r) {
+          // The code found a product with another name: a close match to confirm, not a match.
+          const score = similarity(name, r.name || r.display_name);
+          if (score < NAME_MATCH) {
+            out.set(v, { ...res, status: "probable", source, candidates: res.candidates.map((c) => ({ ...c, score })),
+              note: `code ${parts.get(v).code} is “${r.display_name}”, not “${name}”` });
+            continue;
+          }
+        }
+        out.set(v, res);
+      }
+      return out;
+    }
+
+    return { resolve, resolveAs };
   }
 
-  NS.m2o = { createResolver, escapeLike, orDomain };
+  NS.m2o = { createResolver, escapeLike, orDomain, isProduct, PRODUCT_FORMATS, splitValue, guessFormat, cleanCode, barcodeVariants };
 })();

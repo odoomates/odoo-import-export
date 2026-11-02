@@ -26,6 +26,8 @@
       mapping: [],
       rel: new Map(), // col -> {field, mode, sep}: the relational field a column resolves
       resolutions: new Map(), // col -> Map raw value -> m2o result
+      auto: new Map(), // col -> the automatic m2o results, before a format the user picked
+      formats: new Map(), // col -> [{id, label, found, total}]: formats the user searched product values in, in order
       links: new Map(), // col -> [{field, col}] narrowing links to other columns
       key: null, // {col, field, mode: "update" | "skip" | "create"}
       existing: new Map(), // lower(key value) -> [{id, label}]
@@ -104,11 +106,61 @@
         signal: deps.signal,
       });
       job.resolutions.set(col, res);
+      job.auto.set(col, res);
+      // Searched again in the formats the user picked, in the same order.
+      const picked = job.formats.get(col) || [];
+      job.formats.delete(col);
+      if (canRematch(job, col)) for (const f of picked) await rematch(job, col, f.id, deps);
     }
     job.inFile = [...job.rel.values()].some((r) => r.field.relation === job.model)
       ? fileIndex(job, ["name", "complete_name", ...(await deps.schemas.keyFields(job.model))])
       : new Map();
     await lookupExisting(job, deps);
+  }
+
+  // Product columns can be searched again in a format the user picks (m2o.resolveAs).
+  function canRematch(job, col) {
+    const r = job.rel.get(col);
+    return !!(r && r.mode === "name" && r.field.type === "many2one" && NS.m2o.isProduct(r.field.relation));
+  }
+
+  /* Search the values of a product column still unmatched (and not decided by the user)
+   * again, written in `format`; null goes back to the automatic results. Formats add up
+   * (a mixed column: "[Code] Name" first, then "External ID" for the rest), and a value a
+   * format doesn't find keeps its result (and suggestions).
+   * Returns {id, label, found, total} or null. */
+  async function rematch(job, col, format, deps) {
+    const auto = job.auto.get(col) || new Map();
+    if (!format) {
+      job.formats.delete(col);
+      job.resolutions.set(col, auto);
+      return null;
+    }
+    const rel = job.rel.get(col);
+    const current = job.resolutions.get(col) || auto;
+    const open = [...current].filter(([v, r]) => r.status !== "ok" && r.status !== "archived" && !job.decisions.has(`m2o:${col}:${lower(v)}`)).map(([v]) => v);
+    const res = open.length
+      ? await deps.resolver.resolveAs({
+        relation: rel.field.relation,
+        values: open,
+        format,
+        linkFields: (job.links.get(col) || []).map((l) => l.field),
+        signal: deps.signal,
+      })
+      : new Map();
+    const merged = new Map(current);
+    let found = 0;
+    for (const v of open) {
+      const r = res.get(v);
+      if (!r || r.status === "missing") continue;
+      if (r.status === "ok" || r.status === "archived") found++;
+      merged.set(v, r);
+    }
+    job.resolutions.set(col, merged);
+    const f = NS.m2o.PRODUCT_FORMATS.find((x) => x.id === format);
+    const info = { id: format, label: f ? f.label : format, found, total: open.length };
+    job.formats.set(col, [...(job.formats.get(col) || []), info]);
+    return info;
   }
 
   // How a self-referencing value names a row: "__import__.x" and "x" are the same external id.
@@ -263,7 +315,7 @@
       if (r.status === "archived") {
         push(warnings, { ...base, title: `“${piece}” is archived`, message: `${header}: the only match is an archived ${rel.field.string} record; it will be used.` });
       } else if (r.status === "probable") {
-        push(conflicts, { ...base, title: `“${piece}” → ${r.candidates[0].label}?`, message: `${header}: no exact match in ${rel.field.string}; this one is close.` });
+        push(conflicts, { ...base, title: `“${piece}” → ${r.candidates[0].label}?`, message: r.note ? `${header}: ${r.note}.` : `${header}: no exact match in ${rel.field.string}; this one is close.` });
       } else if (r.status === "ambiguous") {
         push(conflicts, { ...base, title: `“${piece}” matches ${r.candidates.length} records`, message: `${header}: pick the right ${rel.field.string}.` });
       } else {
@@ -771,5 +823,5 @@
     return needsDbId(job) || !!(job.key && job.key.mode === "update" && [...job.defaults.values()].some((d) => d.createOnly));
   }
 
-  NS.plan = { needsDbId, splitPasses, newJob, active, relationOf, pieces, resolveAll, fileIndex, lookupExisting, recordRows, groups, analyze, build, xmlids, toCreate, existingTarget, existingId, isSub };
+  NS.plan = { needsDbId, splitPasses, newJob, active, relationOf, pieces, resolveAll, canRematch, rematch, fileIndex, lookupExisting, recordRows, groups, analyze, build, xmlids, toCreate, existingTarget, existingId, isSub };
 })();

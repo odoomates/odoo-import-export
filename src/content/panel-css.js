@@ -104,6 +104,7 @@ footer {
   padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-2);
 }
 footer .status { color: var(--fg-2); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+footer .status.failed { white-space: normal; max-height: 4.5em; overflow-y: auto; }
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
   border: 1px solid var(--border); background: var(--bg); padding: 6px 12px; border-radius: 6px; cursor: pointer;

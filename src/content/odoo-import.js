@@ -55,6 +55,8 @@
     settings: { batchSize: 500, fast: false },
     expanded: new Set(), // conflict groups unfolded by the user
     groupLimit: new Map(), // group key -> cards drawn (more on demand)
+    formatPick: new Map(), // product column -> format chosen in the picker, not searched yet
+    failure: null, // {message, raw}: the last error, kept in the footer until the next operation or step
     visible: [], // conflict cards on screen, in order (keyboard navigation)
     client: OI.rpc.createClient(),
     deps: null,
@@ -186,6 +188,7 @@
 
   function setBusy(text) {
     S.busy = text || "";
+    if (text) S.failure = null; // a new operation starts
     renderFooter();
   }
 
@@ -275,7 +278,7 @@
       S.op.ctrl.abort();
       endTask();
     }
-    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, count: null, countErr: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map(), sample: null });
+    Object.assign(S, { book: null, job: null, analysis: null, check: null, result: null, count: null, countErr: null, progress: null, busy: "", reviewTab: "conflicts", focus: 0, expanded: new Set(), groupLimit: new Map(), formatPick: new Map(), failure: null, sample: null });
     S.step = "source";
     toast(finished ? "Ready for a new import" : "Discarded");
     render();
@@ -286,8 +289,8 @@
     const raw = e && e.title ? `${e.title}: ${e.message}` : String(e && e.message ? e.message : e);
     const x = OI.errors.explain(raw);
     const msg = x.hint ? `${x.title}. ${x.hint}` : x.title;
-    renderFooter(msg, true);
-    status.title = raw;
+    S.failure = { message: msg, raw };
+    renderFooter();
     return msg;
   }
 
@@ -503,6 +506,7 @@
 
   function go(step) {
     if (!canEnter(step)) return;
+    S.failure = null;
     S.step = step;
     S.focus = 0;
     render();
@@ -825,6 +829,7 @@
       S.reviewTab = "conflicts";
       S.expanded = new Set();
       S.groupLimit = new Map();
+      S.formatPick = new Map();
       endTask();
       setBusy("");
       go("review");
@@ -1225,6 +1230,44 @@
     return head;
   }
 
+  /* Product values not found: "These values are: [Code] Name", then search them that way.
+   * The picker starts on the format most of them fit; nothing is searched until asked. */
+  function formatBar(g) {
+    const values = g.items.map((c) => c.value);
+    const pick = S.formatPick.get(g.col) || OI.m2o.guessFormat(values);
+    const example = h("span", { class: "small muted" });
+    const show = (id) => { example.textContent = formatExample(id, values); };
+    const sel = h("select", { "aria-label": "How the values are written", onchange: () => { S.formatPick.set(g.col, sel.value); show(sel.value); } },
+      OI.m2o.PRODUCT_FORMATS.map((f) => h("option", { value: f.id, selected: f.id === pick }, f.label)));
+    show(pick);
+    return h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;align-items:center" },
+      h("b", null, `${S.job.table.headers[g.col]}: ${values.length.toLocaleString()} unmatched. These values are:`), sel,
+      h("button", { type: "button", class: "btn small", onclick: () => rematch(g.col, sel.value) }, "Search again"), example);
+  }
+
+  function formatExample(id, values) {
+    const fits = values.filter((v) => OI.m2o.splitValue(id, v));
+    if (!fits.length) return "None of these values are written this way.";
+    const v = fits[0];
+    const p = OI.m2o.splitValue(id, v);
+    const what = p.xmlid ? `External ID ${p.xmlid}` : p.code && p.name ? `code ${p.code}, name checked` : p.code ? `${id === "barcode" ? "barcode" : "code"} ${p.code}` : `name “${p.name}”`;
+    const count = fits.length < values.length ? ` (${fits.length} of ${values.length} values are written this way)` : "";
+    return `e.g. “${v}” → ${what}${count}`;
+  }
+
+  // Search a product column again in `format` (null: back to the automatic matches).
+  function rematch(col, format) {
+    return task("rematch", "Searching again…", async (op) => {
+      const info = await OI.plan.rematch(S.job, col, format, op.deps);
+      if (!alive(op)) return;
+      endTask();
+      setBusy("");
+      S.formatPick.delete(col);
+      reanalyze();
+      toast(info ? `${info.found} of ${info.total} found as ${info.label}` : "Back to automatic matching");
+    });
+  }
+
   function describeDecision(key, d) {
     const [kind] = key.split(":");
     const what = key.replace(/^[a-z0-9]+:(\d+:)?/, "");
@@ -1268,6 +1311,12 @@
         h("button", { type: "button", class: "btn small", onclick: () => { job.decisions.set("newrows", { action: "skip" }); reanalyze(); } }, "Update only, skip the new ones")));
     }
     if (job.model === OI.inventory.MODEL && counts()) wrap.append(countModes());
+    for (const [col, list] of job.formats) {
+      wrap.append(h("div", { class: "notice info" }, h("span", null, "ℹ"), h("div", { class: "grow" },
+        h("b", null, `${job.table.headers[col]}: unmatched values searched as ${list.map((f) => f.label).join(", then ")}`),
+        h("div", { class: "small muted" }, list.map((f) => `${f.label}: ${f.found.toLocaleString()} of ${f.total.toLocaleString()} found`).join(" · "))),
+        h("button", { type: "button", class: "btn small", onclick: () => rematch(col, null) }, "Back to automatic")));
+    }
 
     const tabs = h("div", { class: "tabs", role: "tablist" },
       [["conflicts", `To decide (${a.conflicts.length})`], ["warnings", `Warnings (${a.warnings.length})`], ["preview", "Preview data"]].map(([k, l]) =>
@@ -1290,6 +1339,14 @@
         // there are many. S.visible lists the cards on screen, for the keyboard.
         S.visible = [];
         const list = h("div", { class: "cards" });
+        // Product columns first: "These values are: [Code] Name", for every value still open.
+        const productCols = new Map();
+        for (const c of a.conflicts) {
+          if (c.kind !== "m2o" || !OI.plan.canRematch(job, c.col)) continue;
+          if (!productCols.has(c.col)) productCols.set(c.col, []);
+          productCols.get(c.col).push(c);
+        }
+        for (const [col, items] of productCols) list.append(h("div", { class: "group" }, formatBar({ col, items })));
         for (const g of groupConflicts(a.conflicts)) {
           if (g.items.length < 2) {
             list.append(card(g.items[0], S.visible.push(g.items[0]) - 1, false));
@@ -2080,6 +2137,7 @@
   function setMode(mode) {
     if (S.op || S.mode === mode) return;
     S.mode = mode;
+    S.failure = null;
     render();
     if (mode === "export") prepareExport();
     if (mode === "analyze") prepareAnalyze();
@@ -2952,7 +3010,11 @@
     }));
   }
 
-  function renderFooter(message, isError) {
+  function renderFooter() {
+    const message = S.failure && S.failure.message;
+    const isError = !!message;
+    status.title = S.failure ? S.failure.raw : "";
+    status.classList.toggle("failed", isError);
     if (S.versionWarning) {
       for (const b of [backBtn, nextBtn, discardBtn, cancelBtn]) b.hidden = true;
       status.replaceChildren(`Odoo ${S.version.label}`);

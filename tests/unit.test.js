@@ -1125,4 +1125,132 @@ await atest("export columns: the list on screen first, its hidden optional colum
     eq(await OdooImport.export.listViewColumns(client, "res.partner"), { shown: ["name", "email", "phone"], hidden: ["city", "vat"] });
 });
 
+// ---------------------------------------------------------------------------
+// product values in a format the user picks
+const { m2o } = globalThis.OdooImport;
+
+test("product formats: split, clean codes, guess", () => {
+    eq(m2o.splitValue("bracket", "[FURN_001] Office Desk"), { code: "FURN_001", name: "Office Desk" });
+    eq(m2o.splitValue("bracket", "Office Desk"), null);
+    eq(m2o.splitValue("dash", "FURN-001 - Office Desk"), { code: "FURN-001", name: "Office Desk" });
+    eq(m2o.splitValue("paren", "Office Desk (FURN_001)"), { code: "FURN_001", name: "Office Desk" });
+    eq(m2o.splitValue("space", "1001 Office Desk"), { code: "1001", name: "Office Desk" });
+    eq(m2o.splitValue("code", "1001.0"), { code: "1001" });
+    eq(m2o.splitValue("xmlid", "__export__.product_12_ab"), { xmlid: "__export__.product_12_ab" });
+    eq(m2o.splitValue("xmlid", "Office Desk"), null);
+    eq(m2o.cleanCode("8.71234567891E+12"), "8712345678910");
+    eq(m2o.barcodeVariants("1234567"), ["1234567", "01234567", "000001234567", "0000001234567", "00000001234567"]);
+    eq(m2o.guessFormat(["[A1] Desk", "[B2] Chair", "Lamp"]), "bracket");
+    eq(m2o.guessFormat(["FURN_001", "FURN_002"]), "code");
+    eq(m2o.guessFormat(["5901234123457", "4006381333931"]), "barcode");
+    eq(m2o.guessFormat(["Desk", "Office Chair"]), "name");
+    ok(m2o.isProduct("product.template") && !m2o.isProduct("res.partner"));
+});
+
+function productClient(variants, { xmlids = [], search = [] } = {}) {
+    const calls = [];
+    const P = "product.product";
+    const tmplName = (t) => variants.find((v) => v.tmpl === t).name;
+    return {
+        calls,
+        async call(model, method, args) {
+            calls.push(`${model}.${method}`);
+            if (model === "ir.model.data") return xmlids;
+            if (method === "name_search") return search;
+            if (model === P && method === "search_read") {
+                const [[leaf]] = args;
+                const [field, op, terms] = leaf;
+                const hit = op === "in" ? (v) => terms.includes(v[field]) : () => false;
+                return variants.filter(hit).map((v) => ({ id: v.id, default_code: v.default_code, barcode: v.barcode, product_tmpl_id: [v.tmpl, tmplName(v.tmpl)] }));
+            }
+            if (method === "read") {
+                const [ids] = args;
+                if (model === P) return variants.filter((v) => ids.includes(v.id)).map((v) => ({ id: v.id, display_name: `[${v.default_code}] ${v.name}`, name: v.name, active: true, default_code: v.default_code, product_tmpl_id: [v.tmpl, v.name] }));
+                return ids.map((id) => ({ id, display_name: tmplName(id), name: tmplName(id), active: true }));
+            }
+            throw new Error(`unexpected ${model}.${method}`);
+        },
+    };
+}
+const productSchemas = {
+    load: async () => ({ fields: new Map(["name", "active", "default_code", "barcode", "company_id"].map((n) => [n, F(n, "char", n)])) }),
+};
+const VARIANTS = [
+    { id: 1, tmpl: 10, name: "Office Desk", default_code: "A1", barcode: "05901234123457" },
+    { id: 2, tmpl: 20, name: "Chair", default_code: "B2-RED", barcode: null },
+    { id: 3, tmpl: 20, name: "Chair", default_code: "B2-BLUE", barcode: null },
+];
+
+await atest("resolveAs: [Code] Name finds by code, checks the name, suggests by name", async () => {
+    const client = productClient(VARIANTS, { search: [[2, "[B2-RED] Chair"]] });
+    const res = await m2o.createResolver(client, productSchemas).resolveAs({
+        relation: "product.product", format: "bracket", values: ["[a1] Office Desk", "[B2-BLUE] Lamp", "[ZZ] Chairs", "no code"],
+    });
+    eq([res.get("[a1] Office Desk").status, res.get("[a1] Office Desk").id], ["ok", 1], "code, any case");
+    eq(res.get("[B2-BLUE] Lamp").status, "probable", "code of a product with another name");
+    ok(/B2-BLUE/.test(res.get("[B2-BLUE] Lamp").note));
+    eq(res.get("[ZZ] Chairs").status, "probable", "unknown code: close by its name part");
+    eq(res.get("no code").status, "missing");
+});
+
+await atest("resolveAs: barcodes lose zeros; template columns find templates by variant code", async () => {
+    const client = productClient(VARIANTS);
+    const resolver = m2o.createResolver(client, productSchemas);
+    const bar = await resolver.resolveAs({ relation: "product.product", format: "barcode", values: ["5901234123457"] });
+    eq(bar.get("5901234123457").id, 1);
+    const tmpl = await resolver.resolveAs({ relation: "product.template", format: "code", values: ["B2-RED", "b2-blue"] });
+    eq([tmpl.get("B2-RED").id, tmpl.get("b2-blue").id], [20, 20]);
+});
+
+await atest("resolveAs: a template External ID in a variant column", async () => {
+    const xmlids = [{ module: "__export__", name: "tmpl_10", model: "product.template", res_id: 10 }, { module: "__export__", name: "tmpl_20", model: "product.template", res_id: 20 }];
+    const client = productClient(VARIANTS, { xmlids });
+    client.call = ((orig) => async (model, method, args, ...rest) => {
+        if (model === "product.product" && method === "search_read" && args[0][0][0] === "product_tmpl_id") {
+            return VARIANTS.filter((v) => args[0][0][2].includes(v.tmpl)).map((v) => ({ id: v.id, product_tmpl_id: [v.tmpl, v.name] }));
+        }
+        return orig(model, method, args, ...rest);
+    })(client.call.bind(client));
+    const res = await m2o.createResolver(client, productSchemas).resolveAs({ relation: "product.product", format: "xmlid", values: ["__export__.tmpl_10", "__export__.tmpl_20"] });
+    eq(res.get("__export__.tmpl_10").id, 1, "one variant");
+    eq(res.get("__export__.tmpl_20").status, "ambiguous", "two variants: the user picks");
+});
+
+await atest("rematch: only unmatched, undecided values; back to automatic", async () => {
+    const j = job(["Name", "Product"], [["A", "Desk"], ["B", "[A1] Desk"], ["C", "[ZZ] Lamp"], ["D", "[B2] Chair"]], [["name"], null]);
+    const PF = F("product_id", "many2one", "Product", { relation: "product.product" });
+    j.mapping[1] = { col: 1, path: ["product_id"], fields: [PF], status: "auto", score: 1, candidates: [] };
+    j.rel.set(1, { field: PF, mode: "name", sep: "," });
+    const auto = new Map([
+        ["Desk", { status: "ok", id: 1, candidates: [C(1, "Desk")] }],
+        ["[A1] Desk", { status: "missing", id: null, candidates: [] }],
+        ["[ZZ] Lamp", { status: "missing", id: null, candidates: [C(7, "Lamp")] }],
+        ["[B2] Chair", { status: "missing", id: null, candidates: [] }],
+    ]);
+    j.auto.set(1, auto);
+    j.resolutions.set(1, auto);
+    j.decisions.set("m2o:1:[b2] chair", { action: "empty", rows: [3] });
+    ok(plan.canRematch(j, 1));
+    let asked;
+    const resolver = { resolveAs: async ({ values, format }) => {
+        asked = { values, format };
+        return new Map([["[A1] Desk", { status: "ok", id: 1, candidates: [C(1, "Desk")] }], ["[ZZ] Lamp", { status: "missing", id: null, candidates: [] }]]);
+    } };
+    const info = await plan.rematch(j, 1, "bracket", { resolver });
+    eq(asked, { values: ["[A1] Desk", "[ZZ] Lamp"], format: "bracket" });
+    eq([info.found, info.total, info.label], [1, 2, "[Code] Name"]);
+    eq(j.resolutions.get(1).get("[A1] Desk").id, 1);
+    eq(j.resolutions.get(1).get("[ZZ] Lamp").candidates.length, 1, "not found: the automatic suggestions stay");
+    eq(plan.analyze(j).conflicts.map((c) => c.key), ["m2o:1:[zz] lamp"]);
+    await plan.rematch(j, 1, "name", { resolver });
+    eq(asked.values, ["[ZZ] Lamp"], "a second format searches only what is still unmatched");
+    eq(j.resolutions.get(1).get("[A1] Desk").id, 1, "the first format's matches stay");
+    eq(j.formats.get(1).map((f) => f.id), ["bracket", "name"]);
+    await plan.rematch(j, 1, null, { resolver });
+    eq(j.formats.size, 0);
+    eq(j.resolutions.get(1).get("[A1] Desk").status, "missing");
+    j.rel.set(1, { field: F("country_id", "many2one", "Country", { relation: "res.country" }), mode: "name", sep: "," });
+    ok(!plan.canRematch(j, 1), "only product columns");
+});
+
 finish();

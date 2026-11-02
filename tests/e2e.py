@@ -264,6 +264,17 @@ Ready Mat,Customizable Desk,3,99.5
 """
 
 
+# Product values written in several ways (demo data of Odoo 17+): the user picks the format.
+ORDERS_PRODUCT_FORMATS = """Customer,Order Lines/Product,Order Lines/Quantity
+Azure Interior,[E-COM08] Storage Boxes,1
+,[FURN_0002] Desk Pads,2
+,[ZZZ_9] Pedal Bins,3
+,[E-COM07] Office Lamp,4
+,product.product_product_6_product_template,5
+Ready Mat,product.product_product_11_product_template,6
+"""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8069")
@@ -433,6 +444,73 @@ def main():
             errors = ev("E.undo()")
             assert not errors, errors
         check("sale orders with lines: grouped rows, ambiguous product, import, undo", orders)
+
+        def product_formats():
+            s = ev(f"E.start('sale.order', {json.dumps(ORDERS_PRODUCT_FORMATS)})")
+            assert [m[0] for m in s["mapping"]][1] == "order_line/product_id", s["mapping"]
+            assert ev("E.OI.plan.canRematch(E.job, 1)") and not ev("E.OI.plan.canRematch(E.job, 0)")
+            res = lambda v: ev(f"(({{status, id, note, candidates}}) => ({{status, id, note: note || null, ids: candidates.map((c) => c.id)}}))(E.job.resolutions.get(1).get({json.dumps(v)}))")  # noqa: E731
+            pid = lambda code: call("product.product", "search", [["default_code", "=", code]])[0]  # noqa: E731
+            print("     automatic:", {c["key"]: c["status"] for c in s["conflicts"]})
+            # Template External IDs in a variant column are followed automatically.
+            assert res("product.product_product_6_product_template")["status"] == "ok" and res("product.product_product_6_product_template")["id"] == pid("E-COM07")
+            assert res("product.product_product_11_product_template")["status"] == "ambiguous"
+
+            info = ev("E.OI.plan.rematch(E.job, 1, 'bracket', E.deps)")
+            print("     [Code] Name:", info)
+            assert res("[E-COM08] Storage Boxes")["status"] == "ok" and res("[E-COM08] Storage Boxes")["id"] == pid("E-COM08"), res("[E-COM08] Storage Boxes")
+            assert res("[FURN_0002] Desk Pads")["id"] == pid("FURN_0002"), res("[FURN_0002] Desk Pads")
+            lamp = res("[E-COM07] Office Lamp")
+            assert lamp["status"] == "probable" and lamp["id"] == pid("E-COM07") and "Large Cabinet" in lamp["note"], lamp
+            bins = res("[ZZZ_9] Pedal Bins")
+            assert bins["status"] in ("missing", "probable") and pid("E-COM10") in bins["ids"], bins  # unknown code: suggested by its name
+
+            info = ev("E.OI.plan.rematch(E.job, 1, 'xmlid', E.deps)")
+            print("     then External ID:", info)
+            assert info["found"] == 0 and info["total"] == 3, info
+            assert res("product.product_product_6_product_template")["id"] == pid("E-COM07")
+            chairs = res("product.product_product_11_product_template")
+            assert chairs["status"] == "ambiguous" and sorted(chairs["ids"]) == sorted([pid("E-COM12"), pid("E-COM13")]), chairs
+            assert res("[FURN_0002] Desk Pads")["id"] == pid("FURN_0002"), "the first format's matches stay"
+            assert [f["id"] for f in ev("E.job.formats.get(1)")] == ["bracket", "xmlid"]
+
+            s = ev("E.summary()")
+            keys = {c["key"]: c["status"] for c in s["conflicts"]}
+            assert keys.pop("m2o:1:[zzz_9] pedal bins") in ("missing", "probable"), keys
+            assert keys == {"m2o:1:[e-com07] office lamp": "probable", "m2o:1:product.product_product_11_product_template": "ambiguous"}, keys
+            # Looking up again (back from the mapping step) replays the formats.
+            ev("E.OI.pipeline.resolve(E.deps, E.job).then(() => true)")
+            again = {c["key"]: c["status"] for c in ev("E.summary()")["conflicts"]}
+            again.pop("m2o:1:[zzz_9] pedal bins")
+            assert again == keys, again
+            # Back to automatic, then search again and import.
+            ev("E.OI.plan.rematch(E.job, 1, null, E.deps)")
+            assert res("[FURN_0002] Desk Pads")["status"] != "ok" and ev("E.job.formats.size") == 0
+            ev("E.OI.plan.rematch(E.job, 1, 'bracket', E.deps).then(() => E.OI.plan.rematch(E.job, 1, 'xmlid', E.deps))")
+            ev("E.decide('m2o:1:[zzz_9] pedal bins', {action: 'pick', id: %d}); true" % pid("E-COM10"))
+            ev("E.decide('m2o:1:[e-com07] office lamp', {action: 'pick', id: %d}); true" % pid("E-COM07"))
+            s = ev("E.decide('m2o:1:product.product_product_11_product_template', {action: 'pick', id: %d})" % pid("E-COM13"))
+            assert not s["conflicts"], s["conflicts"]
+            r = ev("E.run(true)")
+            assert r["ok"], r
+            r = ev("E.run(false)")
+            assert r["ok"] and len(r["created"]) == 2, r
+            lines = call("sale.order.line", "search_read", [["order_id", "in", r["created"]]], ["product_id", "product_uom_qty"], order="id")
+            got = [(l["product_id"][0], l["product_uom_qty"]) for l in lines]
+            want = [(pid(c), q) for c, q in [("E-COM08", 1), ("FURN_0002", 2), ("E-COM10", 3), ("E-COM07", 4), ("E-COM07", 5), ("E-COM13", 6)]]
+            assert got == want, (got, want)
+            errors = ev("E.undo()")
+            assert not errors, errors
+
+            # Template columns find templates by a variant code; barcodes that lost zeros or turned into numbers.
+            rs = ev("""E.deps.resolver.resolveAs({relation: 'product.template', format: 'code', values: ['e-com12', 'FURN_0096']})
+                .then((m) => Object.fromEntries([...m].map(([k, v]) => [k, v.id])))""")
+            tmpl = lambda code: call("product.product", "read", [pid(code)], ["product_tmpl_id"])[0]["product_tmpl_id"][0]  # noqa: E731
+            assert rs == {"e-com12": tmpl("E-COM12"), "FURN_0096": tmpl("FURN_0096")}, rs
+            rs = ev("""E.deps.resolver.resolveAs({relation: 'product.product', format: 'barcode', values: ['2300001000008.0', '2.300001000008E+12']})
+                .then((m) => [...m.values()].map((v) => v.id))""")
+            assert rs == [pid("FURN_0001")] * 2, rs
+        check("product column: values searched as [Code] Name, then External ID, import, undo", product_formats)
 
         def errors_mapped_to_rows():
             bad = "Name,Color\nOI Tag,1\n,2\n"
@@ -618,6 +696,32 @@ def main():
             time.sleep(1.5)  # a cancelled lookup must not come back and change the panel
             assert not ev("U.q('footer .btn.primary').disabled") and not ev("__odooImport.state.busy"), ev("U.text('footer')")
         check("cancel stops the lookup and keeps the mapping", ui_cancel_lookup)
+
+        def ui_lookup_error():
+            # Odoo refuses a call during the lookup: the panel says so and stays usable.
+            ev("""(() => {
+                const schemas = __odooImport.state.deps.schemas;
+                globalThis.__realDefaults = schemas.defaults;
+                schemas.defaults = async () => { throw {title: 'ValidationError', message: 'Simulated refusal'}; };
+                U.next();
+                return true;
+            })()""")
+            wait("__odooImport.state.failure && !__odooImport.state.op")
+            time.sleep(0.5)  # nothing may redraw the message away
+            assert ev("U.q('nav.steps button.active').textContent.includes('Columns')"), "stays on Columns"
+            assert "Simulated refusal" in ev("U.q('footer .status').title"), ev("U.q('footer .status').title")
+            shown = ev("U.text('footer .status')")
+            assert shown and "Check the matches" not in shown, shown
+            assert ev("U.q('footer .status').classList.contains('failed')")
+            assert not ev("U.q('footer .btn.primary').disabled")
+            shot("2-lookup-error")
+            # Fixed: the next try clears it and goes on.
+            ev("__odooImport.state.deps.schemas.defaults = globalThis.__realDefaults; U.next(); true")
+            wait("U.q('nav.steps button.active').textContent.includes('Review')", timeout=60)
+            assert not ev("__odooImport.state.failure") and not ev("U.q('footer .status').title")
+            ev("U.button('Back').click(); true")
+            wait("U.q('nav.steps button.active').textContent.includes('Columns')")
+        check("an error during the lookup stays in the footer until the next try", ui_lookup_error)
 
         def ui_stop_import():
             ev("U.next(); true")
